@@ -1,6 +1,4 @@
-<p align="center">
-  <img src="docs/assets/akb-hero.png" alt="AKB — agents reading and writing into a permissioned knowledge vault of docs, tables, and files, linked by a URI graph" width="100%">
-</p>
+agents reading and writing into a permissioned knowledge vault of docs, tables, and files, linked by a URI graph
 
 # AKB — Agent Knowledgebase
 
