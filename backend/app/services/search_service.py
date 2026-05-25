@@ -116,6 +116,15 @@ class SearchService:
         user_id: str | None = None,
     ) -> SearchResponse:
         """Hybrid search across documents. See module docstring for flow."""
+        # ACL guard mirroring `grep` below: when neither vault nor
+        # user_id scopes the query, the prefilter block ends up
+        # skipped (has_filters=False) and `_run_vector_search` runs
+        # unscoped — a cross-vault scan. The MCP and REST handlers
+        # both forward user_id today (see issue #66 / PR #67), but
+        # this self-defends against any future caller that forgets.
+        if vault is None and user_id is None:
+            raise ValidationError("vault or user_id required")
+
         pool = await get_pool()
 
         # Generate query embedding. When the embedding API is down we still
@@ -266,10 +275,14 @@ class SearchService:
             if len(unique_hits) >= target_unique:
                 break
 
-        # Capture pre-limit count so callers can tell "this is the full
-        # set" from "first N of more" — the limit-as-count confusion was
-        # observed in the KISA RAG PoC (issue #35).
+        # `total_matches` here is the size of the *prefetch pool* after
+        # source-level dedup, NOT a corpus-wide hit count — vector ANN is
+        # fundamentally top-K. When the pool fills to `target_unique` the
+        # corpus may contain many more hits than we ever fetched, and the
+        # caller deserves an explicit signal (the limit-as-count confusion
+        # this guards against was observed in the KISA RAG PoC, issue #35).
         total_matches = len(unique_hits)
+        prefetch_capped = total_matches >= target_unique
 
         if settings.rerank_enabled and len(unique_hits) > 1:
             unique_hits = await self._apply_rerank(query, unique_hits)
@@ -281,11 +294,19 @@ class SearchService:
         # backward-compatible (doc_id == source_id) while adding table/file.
         results = await self._hydrate_hits(unique_hits)
         returned = len(results)
+        hint = (
+            "Prefetch pool was capped; the corpus may contain more matches than reported. "
+            "For an exact corpus-wide count of a literal substring use akb_grep with "
+            "count_only=true. Semantic queries are inherently top-K and cannot be "
+            "exhaustively enumerated."
+        ) if prefetch_capped else None
         return SearchResponse(
             query=query,
             total=returned,  # deprecated alias of `returned`
             returned=returned,
             total_matches=total_matches,
+            truncated=prefetch_capped,
+            hint=hint,
             results=results,
         )
 
@@ -661,9 +682,18 @@ class SearchService:
                 "files": files,
             }
 
-        # Apply document limit (default response shape only)
-        result_docs = list(docs.values())[:limit]
-        total_matches = sum(len(d["matches"]) for d in result_docs)
+        # Default response shape: separate "what fit under limit"
+        # (`returned_*`) from "what the full scan actually matched"
+        # (`total_*`). Aligning with the hybrid-search response shape
+        # established by issue #35 (`total_matches` MUST always be ≥
+        # `returned`). Filter out chunk-level ILIKE hits that produced
+        # no line-level matches after `strip_chunk_metadata_header` —
+        # those are not real grep hits.
+        matched_docs = [d for d in docs.values() if d["matches"]]
+        total_docs = len(matched_docs)
+        total_matches = sum(len(d["matches"]) for d in matched_docs)
+        result_docs = matched_docs[:limit]
+        returned_matches = sum(len(d["matches"]) for d in result_docs)
 
         # Replace mode: apply find-and-replace on each matching document.
         # Service-layer `doc_service.update` still wants the doc path
@@ -721,10 +751,20 @@ class SearchService:
         resp = {
             "pattern": pattern,
             "regex": regex,
-            "total_docs": len(clean_results),
+            "returned_docs": len(clean_results),
+            "returned_matches": returned_matches,
+            "total_docs": total_docs,
             "total_matches": total_matches,
+            "truncated": total_docs > len(clean_results),
             "results": clean_results,
         }
+        if resp["truncated"]:
+            resp["hint"] = (
+                f"Showing {len(clean_results)} of {total_docs} matching docs "
+                f"(limit={limit}, {returned_matches} of {total_matches} line matches). "
+                f"For full counts use count_only=true; for the full URI list use "
+                f"files_with_matches=true."
+            )
 
         if total_matches == 0 and not regex:
             metachars = set("|.*+?()[]{}^$\\")
@@ -783,3 +823,27 @@ class SearchService:
                 }
                 for r in rows
             ]
+
+    async def list_section_headings(self, vault: str, doc_id: str, limit: int | None = None) -> list[str]:
+        """Return the document's section paths without their bodies.
+
+        Used by `akb_drill_down`'s empty-match fallback to surface the
+        available headings cheaply — pulling full content for a 1000-
+        section doc just to extract heading strings is wasteful.
+        """
+        from app.repositories.document_repo import DocumentRepository
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            doc_match = DocumentRepository.match_clause(2)
+            sql = f"""
+                SELECT c.section_path
+                FROM chunks c
+                JOIN documents d ON c.source_id = d.id AND c.source_type = 'document'
+                JOIN vaults v ON d.vault_id = v.id
+                WHERE v.name = $1 AND {doc_match}
+                ORDER BY c.chunk_index
+            """
+            if isinstance(limit, int) and limit > 0:
+                sql += f" LIMIT {int(limit)}"
+            rows = await conn.fetch(sql, vault, doc_id)
+            return [r["section_path"] for r in rows if r["section_path"]]

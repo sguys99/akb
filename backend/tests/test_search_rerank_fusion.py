@@ -2,7 +2,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.exceptions import ValidationError
+from app.models.document import SearchResponse
 from app.services.search_service import (
+    SearchService,
     fuse_original_and_reranked_hits,
     resolve_first_stage_unique_limit,
 )
@@ -66,3 +69,52 @@ def test_first_stage_unique_limit_keeps_legacy_rerank_off_default():
         rerank_prefetch=30,
         search_prefetch=0,
     ) == 5
+
+
+def test_search_response_defaults_truncated_false_no_hint():
+    """A response built without explicit truncated/hint must default to
+    'not truncated, no hint' — the most common case (small corpus or
+    prefetch pool not filled). Mirrors how the empty-result paths in
+    search_service.py:243 / :262 still construct SearchResponse."""
+    r = SearchResponse(query="x", total=0, returned=0, total_matches=0, results=[])
+    assert r.truncated is False
+    assert r.hint is None
+
+
+def test_search_response_carries_truncated_signal():
+    r = SearchResponse(
+        query="x",
+        total=2,
+        returned=2,
+        total_matches=30,
+        truncated=True,
+        hint="Prefetch pool was capped...",
+        results=[],
+    )
+    assert r.truncated is True
+    assert r.hint and "Prefetch pool" in r.hint
+
+
+@pytest.mark.asyncio
+async def test_search_requires_vault_or_user_id():
+    """Mirror of the same guard in `grep`: a caller that forwards
+    neither `vault` nor `user_id` would otherwise fall through to an
+    unscoped cross-vault scan. All current callers (REST /search, MCP
+    akb_search) forward `user_id`, so this is defense-in-depth for
+    any future caller that forgets."""
+    svc = SearchService()
+    with pytest.raises(ValidationError):
+        await svc.search(query="anything")
+    with pytest.raises(ValidationError):
+        await svc.search(query="anything", vault=None, user_id=None)
+    # Either argument present is enough — no raise.
+    # (Don't actually run the search; just verify the guard returns
+    # control flow back so something further can happen. Catching
+    # downstream errors keeps this a pure-guard unit test that
+    # doesn't need a DB.)
+    try:
+        await svc.search(query="x", vault="v")
+    except ValidationError:
+        pytest.fail("Should not raise ValidationError when vault is set")
+    except Exception:
+        pass  # downstream (DB / embedding) is fine to fail; we only assert the guard
