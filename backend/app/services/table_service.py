@@ -15,9 +15,12 @@ names.
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from datetime import datetime, timezone
 from difflib import get_close_matches
+
+import asyncpg
 
 from app.db.postgres import get_pool
 from app.exceptions import ConflictError, NotFoundError
@@ -98,6 +101,12 @@ async def create_table(
     `collections` row is auto-created via `CollectionRepository.get_or_create`
     if it doesn't exist yet.
     """
+    # pg_table_name maps any punctuation to underscore — allowing hyphens
+    # would let `mcp-items` and `mcp_items` collide on the PG side.
+    if not _TABLE_NAME_RE.fullmatch(name):
+        raise ValueError(
+            f"Invalid table name {name!r}: must match {_TABLE_NAME_RE.pattern}"
+        )
     pool = await get_pool()
     tid = uuid.uuid4()
     now = datetime.now(timezone.utc)
@@ -128,18 +137,26 @@ async def create_table(
                 )
 
             pg_name = table_data_repo.pg_table_name(vault["name"], name)
-            await table_data_repo.create_dynamic_table(conn, pg_name, columns)
-            await table_registry_repo.insert(
-                conn,
-                table_id=tid, vault_id=vault_id, name=name,
-                description=description, columns=columns,
-                created_by=actor_id, now=now,
-                collection_id=collection_id,
-            )
+            try:
+                await table_data_repo.create_dynamic_table(conn, pg_name, columns)
+                await table_registry_repo.insert(
+                    conn,
+                    table_id=tid, vault_id=vault_id, name=name,
+                    description=description, columns=columns,
+                    created_by=actor_id, now=now,
+                    collection_id=collection_id,
+                )
+            except asyncpg.UniqueViolationError as e:
+                # Concurrent create past the find_by_name check races on
+                # UNIQUE(vault_tables) or pg_type. Surface as 409.
+                raise ConflictError(f"Table already exists: {name}") from e
+            # Grant inside the TX so akb_sql can address the table the
+            # instant the create commits (no "exists but 42501" window).
+            await get_role_sync().grant_table_in_conn(conn, vault_id, pg_name)
             await emit_event(
                 conn, "table.create",
                 vault_id=vault_id,
-                resource_uri=table_uri(vault["name"], name),
+                resource_uri=table_uri(vault["name"], name, collection=collection_path),
                 actor_id=actor_id,
                 payload={
                     "vault": vault["name"],
@@ -164,16 +181,10 @@ async def create_table(
     except Exception as e:  # noqa: BLE001
         logger.warning("table metadata indexing failed for %s: %s", name, e)
 
-    # PG-native RBAC: grant SELECT/INSERT/UPDATE/DELETE/ALL on the new
-    # vt_* table to the vault's reader/writer/admin group roles. Tables
-    # without these grants are invisible to akb_user_<uid> roles (PG
-    # returns "relation does not exist" or 42501).
-    await get_role_sync().on_table_create(vault_id, pg_name)
-
     logger.info("Table created: %s → %s (collection=%s)", name, pg_name, collection_path or "<root>")
     return {
         "kind": "table",
-        "uri": table_uri(vault["name"], name),
+        "uri": table_uri(vault["name"], name, collection=collection_path),
         "vault": vault["name"],
         "collection": collection_path or None,
         "name": name,
@@ -182,6 +193,11 @@ async def create_table(
 
 
 from app.util.text import normalize_collection_path as _normalize_collection_path  # noqa: E402
+
+# Table name shape — PG-native identifier grammar. Underscores only
+# (no hyphens) so `pg_table_name`'s `[^a-z0-9] → _` sanitiser doesn't
+# collapse two distinct user-visible names onto the same PG identifier.
+_TABLE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
 async def list_tables(vault_id: uuid.UUID) -> list[dict]:
@@ -199,7 +215,7 @@ async def list_tables(vault_id: uuid.UUID) -> list[dict]:
             count = await table_data_repo.count_rows(conn, pg_name)
             results.append({
                 "kind": "table",
-                "uri": table_uri(vault["name"], r["name"]),
+                "uri": table_uri(vault["name"], r["name"], collection=r["collection"]),
                 "vault": vault["name"],
                 "collection": r["collection"],
                 "name": r["name"],
@@ -233,10 +249,13 @@ async def drop_table(
             table_id = table["id"]
             pg_name = table_data_repo.pg_table_name(vault["name"], table_name)
             await table_data_repo.drop_dynamic_table(conn, pg_name)
+            # Chunks + vector outbox enqueue must commit with the DDL/registry
+            # delete so a crash mid-drop can't leave orphan chunks.
+            from app.services.index_service import delete_table_chunks
+            await delete_table_chunks(conn, str(table_id))
             await table_registry_repo.delete(conn, table_id)
 
-            # Clean up edges referencing this table.
-            t_uri = f"akb://{vault['name']}/table/{table_name}"
+            t_uri = table_uri(vault["name"], table_name, collection=table.get("collection"))
             await conn.execute(
                 "DELETE FROM edges WHERE source_uri = $1 OR target_uri = $1",
                 t_uri,
@@ -245,7 +264,7 @@ async def drop_table(
             await emit_event(
                 conn, "table.drop",
                 vault_id=vault_id,
-                resource_uri=table_uri(vault["name"], table_name),
+                resource_uri=t_uri,
                 actor_id=actor_id,
                 payload={
                     "vault": vault["name"],
@@ -254,13 +273,6 @@ async def drop_table(
                 },
             )
 
-    # Outside the TX: drop the metadata chunk via the vector-store
-    # outbox (same pattern as file deletion).
-    try:
-        await delete_table_index(str(table_id))
-    except Exception as e:  # noqa: BLE001
-        logger.warning("table chunk delete failed for %s: %s", table_name, e)
-
     # PG-native RBAC: DROP TABLE has already cascaded the GRANTs;
     # this hook exists for symmetry + audit (logs at DEBUG).
     await get_role_sync().on_table_drop(vault_id, pg_name)
@@ -268,7 +280,7 @@ async def drop_table(
     logger.info("Table dropped: %s (%s)", table_name, pg_name)
     return {
         "kind": "table",
-        "uri": table_uri(vault["name"], table_name),
+        "uri": table_uri(vault["name"], table_name, collection=table.get("collection")),
         "vault": vault["name"],
         "collection": table.get("collection"),
         "name": table_name,
@@ -300,7 +312,16 @@ async def alter_table(
             if not vault:
                 raise NotFoundError("Vault", str(vault_id))
 
-            table = await table_registry_repo.find_by_name(conn, vault_id, table_name)
+            # FOR UPDATE serialises concurrent alters' read-modify-write
+            # of vault_tables.columns — without it they last-write-wins.
+            table = await conn.fetchrow(
+                """
+                SELECT * FROM vault_tables
+                 WHERE vault_id = $1 AND name = $2
+                 FOR UPDATE
+                """,
+                vault_id, table_name,
+            )
             if not table:
                 raise NotFoundError("Table", table_name)
 
@@ -340,10 +361,11 @@ async def alter_table(
 
             await table_registry_repo.update_columns(conn, table["id"], columns)
 
+            t_uri = table_uri(vault["name"], table_name, collection=table.get("collection"))
             await emit_event(
                 conn, "table.alter",
                 vault_id=vault_id,
-                resource_uri=table_uri(vault["name"], table_name),
+                resource_uri=t_uri,
                 actor_id=actor_id,
                 payload={
                     "vault": vault["name"],
@@ -354,9 +376,23 @@ async def alter_table(
                 },
             )
 
+    # Refresh the metadata chunk so search reflects the new schema —
+    # otherwise the chunk drifts from the ALTER until the table is dropped.
+    try:
+        await index_table_metadata(
+            str(table["id"]),
+            vault_id=vault_id,
+            vault_name=vault["name"],
+            name=table_name,
+            description=table["description"] or "",
+            columns=columns,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("alter_table chunk reindex failed for %s: %s", table_name, e)
+
     return {
         "kind": "table",
-        "uri": table_uri(vault["name"], table_name),
+        "uri": t_uri,
         "vault": vault["name"],
         "name": table_name,
         "columns": columns,

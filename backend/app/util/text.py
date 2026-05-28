@@ -73,6 +73,17 @@ class NFCModel(BaseModel):
 _MAX_PATH_BYTES = 1024
 
 
+# URI structural markers — using these as collection-path segments
+# creates a round-trip ambiguity in the 0.3.0 URI grammar
+# (`akb://V/coll/<coll_path>/<type>/<id>`). Example: a collection
+# at path ``frontend/file/X`` would emit URI
+# ``akb://V/coll/frontend/file/X``, which the parser then mis-classifies
+# as a file URI (coll="frontend", type="file", id="X"). Banning them
+# at create time keeps the grammar unambiguous and matches the
+# existing ``_RESERVED`` column-name guard in ``table_data_repo``.
+RESERVED_COLLECTION_SEGMENTS = frozenset({"coll", "doc", "table", "file"})
+
+
 def normalize_collection_path(path: str | None, *, allow_empty: bool = True) -> str:
     """Canonical collection-path normalizer.
 
@@ -82,6 +93,10 @@ def normalize_collection_path(path: str | None, *, allow_empty: bool = True) -> 
       - Reject `.`, `..`, empty segments (path traversal).
       - Reject NUL, backslash, and control characters (ord < 32).
       - Reject paths longer than 1 KiB encoded (`_MAX_PATH_BYTES`).
+      - Reject the URI structural markers ``coll`` / ``doc`` /
+        ``table`` / ``file`` as any segment. They round-trip
+        ambiguously in the URI grammar (see
+        ``RESERVED_COLLECTION_SEGMENTS`` above).
 
     Returns "" for empty / None input when `allow_empty=True`
     (== vault root). When `allow_empty=False`, an empty input raises
@@ -115,5 +130,27 @@ def normalize_collection_path(path: str | None, *, allow_empty: bool = True) -> 
             raise ValueError(
                 f"Invalid character in collection path: '{path}'"
             )
+        if raw in RESERVED_COLLECTION_SEGMENTS:
+            raise ValueError(
+                f"Invalid collection path: '{path}'. Segment '{raw}' is a "
+                f"URI structural marker; using it as a collection name "
+                f"creates ambiguity in the canonical URI form "
+                f"(akb://V/coll/<path>/<type>/<id>). Choose a different "
+                f"name. Reserved segments: "
+                f"{sorted(RESERVED_COLLECTION_SEGMENTS)}."
+            )
         parts.append(raw)
     return "/".join(parts)
+
+
+def like_escape(s: str) -> str:
+    """Escape ``%`` / ``_`` / ``\\`` so the result is safe to splice into
+    a SQL ``LIKE`` (or ``ILIKE``) pattern. Pair with ``ESCAPE '\\'``
+    in the query so PostgreSQL knows we wrote ``\\%`` to mean literal
+    ``%``, not "any sequence".
+
+    The four call sites we have (``document_repo._like_escape``,
+    plus inline copies in repo prefix-filters) repeated this exact
+    triple replace. Consolidate here so a new repo doesn't reinvent
+    the rule with subtly different escape semantics."""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")

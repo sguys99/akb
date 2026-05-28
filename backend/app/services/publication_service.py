@@ -272,7 +272,7 @@ async def create_publication(
             if resource_type == ResourceType.DOCUMENT and resource_uri:
                 parsed = parse_uri(resource_uri)
                 doc_path_for_check = (
-                    parsed[2] if parsed and parsed[1] == "doc" else None
+                    parsed.identifier if parsed and parsed.kind == "doc" else None
                 )
                 if doc_path_for_check is not None:
                     found = await conn.fetchval(
@@ -383,7 +383,21 @@ async def create_publication_for_vault(
             uuid.UUID(file_id)
         except ValueError:
             raise ValueError("Invalid file_id format")
-        resource_uri = file_uri(vault_name, file_id)
+        # Resolve the file's collection so the canonical URI includes
+        # its location prefix. Vault-root files come back with NULL
+        # collection_id — `file_uri` falls through to the root form.
+        async with pool.acquire() as conn:
+            file_coll_row = await conn.fetchrow(
+                """
+                SELECT c.path AS collection
+                  FROM vault_files f
+                  LEFT JOIN collections c ON c.id = f.collection_id
+                 WHERE f.id = $1 AND f.vault_id = $2
+                """,
+                uuid.UUID(file_id), vault_id,
+            )
+        file_collection = file_coll_row["collection"] if file_coll_row else None
+        resource_uri = file_uri(vault_name, file_id, collection=file_collection)
     elif resource_type == ResourceType.TABLE_QUERY:
         if not resolved_query_vaults:
             resolved_query_vaults = [vault_name]
@@ -461,11 +475,24 @@ async def delete_publications_for_document(document_id: uuid.UUID | str) -> int:
 
 
 async def delete_publications_for_file(file_id: uuid.UUID | str, vault_name: str) -> int:
-    """Delete all publications for a given file (URI-based)."""
+    """Delete all publications for a given file. Looks up the file's
+    collection so the URI matches the canonical form stored in the
+    ``publications.resource_uri`` column."""
     from app.services.uri_service import file_uri
-    uri = file_uri(vault_name, str(file_id))
     pool = await get_pool()
     async with pool.acquire() as conn:
+        coll_row = await conn.fetchrow(
+            """
+            SELECT c.path AS collection
+              FROM vault_files f
+              JOIN vaults v ON v.id = f.vault_id
+              LEFT JOIN collections c ON c.id = f.collection_id
+             WHERE f.id = $1 AND v.name = $2
+            """,
+            uuid.UUID(str(file_id)), vault_name,
+        )
+        collection = coll_row["collection"] if coll_row else None
+        uri = file_uri(vault_name, str(file_id), collection=collection)
         rows = await conn.fetch(
             "DELETE FROM publications WHERE resource_uri = $1 RETURNING id",
             uri,
@@ -600,19 +627,35 @@ async def resolve_publication(
             # separate statements with no row lock, so N concurrent
             # readers all saw view_count < max_views and all incremented,
             # overshooting max_views by up to N-1 (06-F8 / 04-F7).
+            #
+            # Re-check expires_at inside the UPDATE too — between the
+            # SELECT above and this UPDATE another caller could
+            # post-date `expires_at` via an admin edit, and we don't
+            # want to record a view against a publication that became
+            # expired in the gap.
             updated = await conn.fetchrow(
                 """
                 UPDATE publications
                    SET view_count = view_count + 1
                  WHERE id = $1
                    AND (max_views IS NULL OR view_count < max_views)
-                 RETURNING view_count, max_views
+                   AND (expires_at IS NULL OR expires_at > NOW())
+                 RETURNING view_count, max_views, expires_at
                 """,
                 row["id"],
             )
             if updated is None:
-                # The row exists but max_views was already reached at the
-                # moment the UPDATE ran — concurrent reader beat us.
+                # Either max_views was reached or expires_at lapsed
+                # between the SELECT and the UPDATE. Re-resolve which
+                # one to surface so the caller sees the same error class
+                # they would have seen with stale data.
+                cur = await conn.fetchrow(
+                    "SELECT expires_at, view_count, max_views FROM publications WHERE id = $1",
+                    row["id"],
+                )
+                if cur is not None and cur["expires_at"] is not None and \
+                        cur["expires_at"] <= datetime.now(timezone.utc):
+                    raise PublicationExpired()
                 raise PublicationViewLimitReached()
             # Reflect the post-increment counter back so the response is
             # consistent with the value that just landed in PG.
@@ -648,9 +691,9 @@ async def resolve_document_publication(publication: dict) -> dict:
     from app.services.uri_service import parse_uri
     uri = publication.get("resource_uri")
     parsed = parse_uri(uri) if uri else None
-    if parsed is None or parsed[1] != "doc":
+    if parsed is None or parsed.kind != "doc":
         raise NotFoundError("Document", str(uri))
-    uri_vault, _rtype, doc_path = parsed
+    uri_vault, doc_path = parsed.vault, parsed.identifier
 
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -776,9 +819,9 @@ async def resolve_file_publication(publication: dict) -> dict:
     from app.services.uri_service import parse_uri
     uri = publication.get("resource_uri")
     parsed = parse_uri(uri) if uri else None
-    if parsed is None or parsed[1] != "file":
+    if parsed is None or parsed.kind != "file":
         raise NotFoundError("File", str(uri))
-    _uri_vault, _rtype, file_uuid_str = parsed
+    file_uuid_str = parsed.identifier
 
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -829,9 +872,9 @@ async def get_file_storage_for_publication(publication: dict) -> dict:
     from app.services.uri_service import parse_uri
     uri = publication.get("resource_uri")
     parsed = parse_uri(uri) if uri else None
-    if parsed is None or parsed[1] != "file":
+    if parsed is None or parsed.kind != "file":
         raise NotFoundError("File", str(uri))
-    _uri_vault, _rtype, file_uuid_str = parsed
+    file_uuid_str = parsed.identifier
 
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -1000,49 +1043,59 @@ async def create_snapshot(publication_id: uuid.UUID) -> dict:
     return the cached result instead of re-running the query.
     """
     pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT s.id, s.slug, s.vault_id, s.resource_type, s.query_sql,
-                   s.query_vault_names, s.query_params, s.title,
-                   v.name AS vault_name
-            FROM publications s JOIN vaults v ON s.vault_id = v.id
-            WHERE s.id = $1
-            """,
-            publication_id,
-        )
-        if row is None:
-            raise PublicationNotFound(str(publication_id))
+    # Session-scoped advisory lock keyed on the publication id so two
+    # concurrent /snapshot calls on the same publication don't both run
+    # the (potentially slow) table query, upload to S3 twice, and race
+    # on the final UPDATE. Released on connection close.
+    lock_key = int.from_bytes(publication_id.bytes[:8], "big", signed=True)
+    async with pool.acquire() as lock_conn:
+        async with lock_conn.transaction():
+            await lock_conn.execute("SELECT pg_advisory_xact_lock($1)", lock_key)
 
-    publication = _publication_row_to_dict(row)
-    assert publication is not None  # row is non-None
-    if publication["resource_type"] != ResourceType.TABLE_QUERY:
-        raise PublicationError("Snapshots only supported for table_query publications", status_code=400)
+            row = await lock_conn.fetchrow(
+                """
+                SELECT s.id, s.slug, s.vault_id, s.resource_type, s.query_sql,
+                       s.query_vault_names, s.query_params, s.title,
+                       v.name AS vault_name
+                FROM publications s JOIN vaults v ON s.vault_id = v.id
+                WHERE s.id = $1
+                """,
+                publication_id,
+            )
+            if row is None:
+                raise PublicationNotFound(str(publication_id))
 
-    # Force live execution for the snapshot (regardless of current mode)
-    publication_for_exec = {**publication, "mode": Mode.LIVE}
-    result = await resolve_table_query_publication(publication_for_exec, {})
+            publication = _publication_row_to_dict(row)
+            assert publication is not None  # row is non-None
+            if publication["resource_type"] != ResourceType.TABLE_QUERY:
+                raise PublicationError(
+                    "Snapshots only supported for table_query publications",
+                    status_code=400,
+                )
 
-    s3_key = f"snapshots/{publication_id}.json"
-    try:
-        file_service.put_object_bytes(
-            s3_key,
-            json.dumps(result, ensure_ascii=False).encode("utf-8"),
-            content_type="application/json",
-        )
-    except (file_service.StorageError, IOError) as e:
-        raise PublicationError(f"Failed to upload snapshot: {e}", status_code=502)
+            # Force live execution for the snapshot (regardless of current mode)
+            publication_for_exec = {**publication, "mode": Mode.LIVE}
+            result = await resolve_table_query_publication(publication_for_exec, {})
 
-    now = datetime.now(timezone.utc)
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE publications
-            SET snapshot_s3_key = $1, snapshot_at = $2, mode = 'snapshot', updated_at = $2
-            WHERE id = $3
-            """,
-            s3_key, now, publication_id,
-        )
+            s3_key = f"snapshots/{publication_id}.json"
+            try:
+                file_service.put_object_bytes(
+                    s3_key,
+                    json.dumps(result, ensure_ascii=False).encode("utf-8"),
+                    content_type="application/json",
+                )
+            except (file_service.StorageError, IOError) as e:
+                raise PublicationError(f"Failed to upload snapshot: {e}", status_code=502)
+
+            now = datetime.now(timezone.utc)
+            await lock_conn.execute(
+                """
+                UPDATE publications
+                SET snapshot_s3_key = $1, snapshot_at = $2, mode = 'snapshot', updated_at = $2
+                WHERE id = $3
+                """,
+                s3_key, now, publication_id,
+            )
 
     return {
         "snapshot_s3_key": s3_key,

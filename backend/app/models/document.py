@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -40,7 +39,6 @@ class DocumentPutRequest(NFCModel):
     summary: str | None = None
     depends_on: list[str] = Field(default_factory=list)
     related_to: list[str] = Field(default_factory=list)
-    metadata: dict[str, Any] = Field(default_factory=dict)
     # Optional explicit slug for the file path under the collection.
     # When omitted, the slug is derived from `title`. The seed flow and
     # frontend "Create from template" both pass an explicit slug so the
@@ -61,7 +59,6 @@ class DocumentUpdateRequest(NFCModel):
     summary: str | None = None
     depends_on: list[str] | None = None
     related_to: list[str] | None = None
-    metadata: dict[str, Any] | None = None
     message: str | None = None  # commit message
     # Optimistic concurrency: when provided, the update is rejected with
     # 409 unless the document's current_commit matches. Use to detect a
@@ -163,13 +160,17 @@ class BrowseResponse(BaseModel):
 class SearchResult(BaseModel):
     """Single search result. Unifies document / table / file results;
     `source_type` discriminates how the frontend renders the row.
-    `uri` is the only canonical handle — internal IDs are not exposed."""
+    `uri` is the only canonical handle — internal IDs are not exposed.
+    `collection` is the containing collection path (null at vault
+    root). Surfaced explicitly so a client can group or filter hits by
+    collection without parsing the URI."""
 
     source_type: str                                  # 'document' | 'table' | 'file'
     uri: str                                          # canonical akb:// URI
     vault: str
     path: str
     title: str
+    collection: str | None = None                     # containing collection (null at vault root)
     doc_type: str | None = None
     summary: str | None = None
     tags: list[str] = Field(default_factory=list)

@@ -109,6 +109,11 @@ async def _apply_migrations() -> None:
         "022_publications_resource_uri.py",     # collapse publications (document_id, file_id) → publications.resource_uri (URI canonical)
         "023_drop_metadata_id.py",              # strip legacy d-prefix `metadata.id` from documents (cosmetic; SQL lookup arm already removed)
         "024_tokens_revoked_before.py",         # users.tokens_revoked_before for JWT revocation (default epoch — pre-existing JWTs unaffected)
+        "025_drop_phantom_root_collection.py",  # drop path='' collection rows that legacy put() created when collection was omitted (issues #81/#82)
+        "026_uri_collection_prefix.py",         # rewrite edges/publications/events URIs to 0.3.0 canonical (akb://V[/coll/<path>]/<type>/<id>)
+        "027_collection_path_reserved_segments.py",  # WARN about pre-existing collection paths whose segments collide with URI structural markers (coll/doc/table/file)
+        "028_edges_kind.py",                    # edges.kind ('implicit' rewriteable | 'explicit' akb_link-created) so akb_link edges survive akb_update rewrites
+        "029_outbox_chunk_id_index.py",         # partial index on vector_delete_outbox(chunk_id) WHERE processed_at IS NULL for reaper dedup lookups
     ):
         module = _load_migration(filename)
         if module is None:

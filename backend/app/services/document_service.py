@@ -132,7 +132,7 @@ from app.services.index_service import (
 )
 from app.services.kg_service import delete_document_relations, store_document_relations
 from app.services.role_sync import get_role_sync
-from app.services.uri_service import doc_uri, table_uri, file_uri
+from app.services.uri_service import coll_uri, doc_uri, file_uri, table_uri
 from app.repositories import table_data_repo
 from app.utils import ensure_list
 
@@ -185,8 +185,6 @@ def _build_frontmatter(req: DocumentPutRequest, now: datetime) -> dict:
         fm["depends_on"] = req.depends_on
     if req.related_to:
         fm["related_to"] = req.related_to
-    if req.metadata:
-        fm.update(req.metadata)
     return fm
 
 
@@ -282,15 +280,23 @@ class DocumentService:
         # matches the document's stored `path`. Passing the raw
         # `req.collection` here would create rows with leading/trailing
         # slashes or whitespace, diverging from the doc path under it.
-        collection_id = await coll_repo.get_or_create(vault_id, normalized_collection)
+        # Empty (== vault root) maps to NULL FK, matching the convention
+        # used by file_service / table_service / external_git_service —
+        # never insert a `path=""` phantom collection row.
+        collection_id = (
+            await coll_repo.get_or_create(vault_id, normalized_collection)
+            if normalized_collection
+            else None
+        )
         # No `id` key — canonical handle is the akb:// URI built from
-        # (vault, path), not a short hash.
-        metadata = dict(req.metadata or {})
+        # (vault, path), not a short hash. The `metadata` JSONB column is
+        # reserved for internal writers (external-git import, LLM auto-tagging)
+        # — user document writes never populate it.
         pg_doc_id = await doc_repo.create(
             vault_id=vault_id, collection_id=collection_id, path=file_path,
             title=req.title, doc_type=req.type, status="draft",
             summary=fm_dict.get("summary") or req.summary, domain=req.domain, created_by=agent_id,
-            now=now, commit_hash=commit_hash, tags=req.tags, metadata=metadata,
+            now=now, commit_hash=commit_hash, tags=req.tags, metadata={},
         )
 
         # Index: write chunks into PG (truth) + best-effort vector-store upsert.
@@ -518,8 +524,6 @@ class DocumentService:
             current_fm["depends_on"] = req.depends_on
         if req.related_to is not None:
             current_fm["related_to"] = req.related_to
-        if req.metadata:
-            current_fm.update(req.metadata)
         current_fm["updated_at"] = now.isoformat()
 
         new_body = req.content if req.content is not None else current_body
@@ -845,11 +849,25 @@ class DocumentService:
     async def browse(self, vault: str, collection: str | None = None, depth: int = 1, content_type: str = "all") -> BrowseResponse:
         """Unified vault browse.
 
-        - `collection=None`  → top-level: collections + ROOT docs/tables/files
-          (resources whose `collection_id IS NULL`).
-        - `collection="X"`   → docs/tables/files whose `collection_id` matches
-          collection `X`. Subcollection nesting is left to the frontend tree
-          to assemble from the flat collection list.
+        ``depth`` is **tree-depth from the browse root**, mirroring the
+        ``tree -L N`` convention:
+
+          * ``depth=0`` — only direct children of the browse root;
+            no descent into any collection.
+          * ``depth=N`` (N ≥ 1) — additionally descend ``N`` levels
+            of collections.
+          * ``depth=-1`` — unbounded; the entire subtree of the
+            browse root.
+
+        Browse root is the vault root when ``collection`` is omitted,
+        otherwise it is that collection. ``content_type`` lets callers
+        narrow to ``documents`` / ``tables`` / ``files`` only.
+
+        Collection rows themselves are always emitted (they are
+        navigation aids — the response would be useless without them),
+        with ``path`` scoped to the requested subtree when
+        ``collection`` is provided. ``doc`` / ``table`` / ``file`` rows
+        are the ones gated by depth.
         """
         vault_repo, doc_repo, coll_repo = await self._repos()
 
@@ -864,51 +882,69 @@ class DocumentService:
         show_files = content_type in ("all", "files")
 
         items: list[BrowseItem] = []
+        prefix = collection or ""
 
-        if collection:
-            coll_id = await self._resolve_collection_id(vault_id, collection)
-            if show_docs:
-                items.extend(await self._browse_docs_in_collection(doc_repo, vault, vault_id, collection))
-            if show_tables:
-                items.extend(await self._browse_tables(
-                    vault, vault_id, collection_id=coll_id, scoped=True,
-                ))
-            if show_files:
-                items.extend(await self._browse_files(
-                    vault, vault_id, collection_id=coll_id, scoped=True,
-                ))
-        else:
-            # Top-level browse returns the full picture: every collection,
-            # every doc (paths encode their collection), and every table /
-            # file with its `collection` attribute. The frontend tree
-            # builder then groups tables/files under their collection
-            # without a second round-trip. Scoped queries happen only when
-            # the caller explicitly passes `collection=`.
-            if show_docs:
-                items.extend(await self._browse_collections(doc_repo, coll_repo, vault, vault_id, depth))
-            if show_tables:
-                items.extend(await self._browse_tables(vault, vault_id))
-            if show_files:
-                items.extend(await self._browse_files(vault, vault_id))
+        if show_docs:
+            # Collections are conceptually navigation aids for the
+            # *document* tree (file/table also live under collections,
+            # but a `content_type="tables"` caller is asking for tables
+            # specifically — they don't want the nav rows). Gating on
+            # show_docs keeps the response narrow when content_type
+            # excludes documents.
+            items.extend(await self._browse_collections(coll_repo, vault, vault_id, prefix))
+            items.extend(await self._browse_docs(
+                doc_repo, vault, vault_id, prefix=prefix, max_depth=depth,
+            ))
+        if show_tables:
+            items.extend(await self._browse_tables_by_depth(
+                vault, vault_id, prefix=prefix, max_depth=depth,
+            ))
+        if show_files:
+            items.extend(await self._browse_files_by_depth(
+                vault, vault_id, prefix=prefix, max_depth=depth,
+            ))
 
         hint = self._browse_hint(vault, collection, items)
         return BrowseResponse(vault=vault, path=browse_path, items=items, hint=hint)
 
-    async def _resolve_collection_id(self, vault_id, collection_path: str):
-        """Resolve a path to its `collections.id`. Returns None if the
-        collection row doesn't exist yet (e.g. browsing a path that
-        no resource has been put into). Caller treats None as "no
-        scoped resources here"."""
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT id FROM collections WHERE vault_id = $1 AND path = $2",
-                vault_id, collection_path,
-            )
-        return row["id"] if row else None
+    async def _browse_collections(self, coll_repo, vault: str, vault_id, prefix: str) -> list[BrowseItem]:
+        """Emit collection rows. With ``prefix`` empty, emits every
+        collection in the vault. With a non-empty prefix, restricts to
+        collections strictly under that subtree (``prefix/X``,
+        ``prefix/X/Y``, …) so a scoped browse only shows the relevant
+        navigation slice. The collection at ``prefix`` itself is
+        excluded — clients already know they are inside it.
 
-    async def _browse_docs_in_collection(self, doc_repo, vault: str, vault_id, collection: str) -> list[BrowseItem]:
-        rows = await doc_repo.list_by_collection(vault_id, collection)
+        Each emitted row carries the canonical ``akb://V/coll/X`` URI
+        so callers can paste it back into ``akb_browse(uri=...)`` to
+        drill in — collections are now URI-citizens like docs / tables
+        / files (closing the long-standing gap from pre-0.3.0)."""
+        all_rows = await coll_repo.list_by_vault(vault_id)
+        items: list[BrowseItem] = []
+        for r in all_rows:
+            if prefix:
+                if not r["path"].startswith(prefix + "/"):
+                    continue
+            items.append(BrowseItem(
+                name=r["name"], path=r["path"], type="collection",
+                uri=coll_uri(vault, r["path"]),
+                summary=r["summary"], doc_count=r["doc_count"],
+                last_updated=r["last_updated"],
+            ))
+        return items
+
+    async def _browse_docs(
+        self,
+        doc_repo,
+        vault: str,
+        vault_id,
+        *,
+        prefix: str,
+        max_depth: int,
+    ) -> list[BrowseItem]:
+        """Documents under ``prefix`` whose depth (from inside the
+        prefix) is ≤ ``max_depth``. ``max_depth < 0`` is unbounded."""
+        rows = await doc_repo.list_docs_by_depth(vault_id, max_depth, prefix)
         return [
             BrowseItem(
                 name=r["title"], path=r["path"], type="document",
@@ -920,44 +956,25 @@ class DocumentService:
             for r in rows
         ]
 
-    async def _browse_collections(self, doc_repo, coll_repo, vault: str, vault_id, depth: int) -> list[BrowseItem]:
-        items: list[BrowseItem] = []
-        coll_rows = await coll_repo.list_by_vault(vault_id)
-        for r in coll_rows:
-            items.append(BrowseItem(
-                name=r["name"], path=r["path"], type="collection",
-                summary=r["summary"], doc_count=r["doc_count"],
-                last_updated=r["last_updated"],
-            ))
-        if depth >= 2:
-            doc_rows = await doc_repo.list_by_vault(vault_id)
-            for r in doc_rows:
-                items.append(BrowseItem(
-                    name=r["title"], path=r["path"], type="document",
-                    uri=doc_uri(vault, r["path"]),
-                    summary=r["summary"], doc_type=r["doc_type"], status=r["status"],
-                    tags=list(r["tags"]) if r["tags"] else [],
-                    last_updated=r["updated_at"],
-                ))
-        return items
-
-    async def _browse_tables(
+    async def _browse_tables_by_depth(
         self,
         vault: str,
         vault_id,
         *,
-        collection_id=None,
-        scoped: bool = False,
+        prefix: str,
+        max_depth: int,
     ) -> list[BrowseItem]:
-        """List tables. With `scoped=True`, only tables whose
-        `collection_id` matches (NULL = vault root)."""
+        """Tables under ``prefix`` whose containing-collection depth
+        (relative to the prefix) is ≤ ``max_depth``. ``max_depth < 0``
+        is unbounded. Mirrors `_browse_docs`'s semantics so the four
+        item types share one rule."""
         from app.repositories import table_registry_repo
         items: list[BrowseItem] = []
         pool = await get_pool()
         async with pool.acquire() as conn:
             vault_row = await conn.fetchrow("SELECT name FROM vaults WHERE id = $1", vault_id)
             table_rows = await table_registry_repo.list_for_vault(
-                conn, vault_id, collection_id=collection_id, scoped=scoped,
+                conn, vault_id, max_depth=max_depth, prefix=prefix,
             )
             for r in table_rows:
                 pg_name = table_data_repo.pg_table_name(vault_row["name"], r["name"])
@@ -967,8 +984,15 @@ class DocumentService:
                     row_count = 0
                 cols = ensure_list(r["columns"]) if isinstance(r["columns"], str) else r["columns"]
                 items.append(BrowseItem(
-                    name=r["name"], path=f"_tables/{r['name']}", type="table",
-                    uri=table_uri(vault, r["name"]),
+                    # `path` is the table name. Pre-0.3.0 it was a
+                    # synthetic `_tables/<name>` string, which made
+                    # sense before tables had URIs — the prefix
+                    # substituted for "what kind of resource is this".
+                    # Now `type="table"` + `uri` (which encodes both
+                    # location and kind) carry that signal, so the
+                    # synthetic prefix is pure noise.
+                    name=r["name"], path=r["name"], type="table",
+                    uri=table_uri(vault, r["name"], collection=r.get("collection")),
                     summary=r["description"], row_count=row_count,
                     columns=cols,
                     collection=r.get("collection"),
@@ -976,20 +1000,20 @@ class DocumentService:
                 ))
         return items
 
-    async def _browse_files(
+    async def _browse_files_by_depth(
         self,
         vault: str,
         vault_id,
         *,
-        collection_id=None,
-        scoped: bool = False,
+        prefix: str,
+        max_depth: int,
     ) -> list[BrowseItem]:
         from app.repositories import vault_files_repo
         pool = await get_pool()
         async with pool.acquire() as conn:
             rows = await vault_files_repo.list_for_vault(
                 conn, vault_id,
-                collection_id=collection_id, scoped=scoped,
+                max_depth=max_depth, prefix=prefix,
                 # Browse renders the full list — don't apply a 50-row
                 # cap silently. If this turns into a performance issue
                 # we can paginate at the route layer.
@@ -1003,7 +1027,12 @@ class DocumentService:
                 # display string and must not embed the file UUID.
                 path=(f"{r.get('collection')}/{r['name']}" if r.get("collection") else r["name"]),
                 type="file",
-                uri=file_uri(vault, str(r["id"])),
+                # Pass collection so the URI takes 0.3.0 canonical form
+                # akb://V/coll/<path>/file/<uuid> instead of root-form
+                # akb://V/file/<uuid>. Without this, browse → akb_link
+                # round-trips re-pollute the edges table with non-canonical
+                # URIs that migration 026 already cleaned up.
+                uri=file_uri(vault, str(r["id"]), collection=r.get("collection")),
                 mime_type=r["mime_type"],
                 size_bytes=r["size_bytes"], summary=r["description"],
                 collection=r.get("collection"),
@@ -1183,7 +1212,16 @@ class DocumentService:
             coll_name = coll.get("name", path)
             guide = coll.get("guide", "")
 
-            # Create collection
+            # Create collection. Defensive: never call get_or_create
+            # with an empty path — that would re-introduce the phantom
+            # path='' row that issues #81/#82 fixed. Today every shipped
+            # template has a non-empty path; the guard exists so a
+            # future template typo can't quietly resurrect the bug.
+            if not path:
+                logger.warning(
+                    "Template %s collection skipped: empty path", template,
+                )
+                continue
             await coll_repo.get_or_create(vault_id, path)
 
             # Create _guide.md in collection

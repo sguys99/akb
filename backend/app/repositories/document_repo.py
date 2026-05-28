@@ -193,6 +193,63 @@ class DocumentRepository:
             )
             return [dict(r) for r in rows]
 
+    async def list_docs_by_depth(
+        self,
+        vault_id: uuid.UUID,
+        max_depth: int,
+        prefix: str = "",
+    ) -> list[dict]:
+        """List documents under ``prefix`` (vault root if ``prefix=""``)
+        whose containing-collection depth, measured from inside the
+        prefix, is ≤ ``max_depth``. ``max_depth < 0`` disables the
+        depth filter (entire subtree).
+
+        Depth = number of path separators *between* the prefix boundary
+        and the document filename:
+          - prefix="", path="doc.md"        → depth 0 (vault root)
+          - prefix="", path="X/doc.md"      → depth 1 (one collection in)
+          - prefix="", path="X/Y/doc.md"    → depth 2 (nested)
+          - prefix="X", path="X/doc.md"     → depth 0 (root of X)
+          - prefix="X", path="X/Y/doc.md"   → depth 1 (one level inside X)
+
+        Slashes are counted via ``length - length(replace(...,'/',''))``
+        because ``string_to_array`` rejects empty input — this form
+        handles vault-root docs uniformly.
+        """
+        base_select = (
+            "SELECT path, title, doc_type, status, summary, tags, updated_at "
+            "FROM documents WHERE vault_id = $1"
+        )
+        params: list = [vault_id]
+
+        if prefix:
+            # Defend against LIKE metacharacters even though normalized
+            # collection paths shouldn't contain them. Goes through
+            # the shared helper so all four call sites agree on the
+            # escape semantics.
+            from app.util.text import like_escape
+            params.append(like_escape(prefix) + "/%")
+            prefix_clause = f" AND path LIKE ${len(params)} ESCAPE '\\'"
+            # Slashes the prefix itself contributes to `path`: "X" → 1,
+            # "X/Y" → 2 (the prefix separator plus its own internal slashes).
+            depth_offset = prefix.count("/") + 1
+        else:
+            prefix_clause = ""
+            depth_offset = 0
+
+        if max_depth < 0:
+            depth_clause = ""
+        else:
+            params.append(max_depth + depth_offset)
+            depth_clause = (
+                f" AND (length(path) - length(replace(path, '/', ''))) <= ${len(params)}"
+            )
+
+        sql = base_select + prefix_clause + depth_clause + " ORDER BY updated_at DESC"
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(sql, *params)
+            return [dict(r) for r in rows]
+
     # ── External-git mirror helpers ──────────────────────────
 
     async def list_external_blobs(self, vault_id: uuid.UUID) -> dict[str, dict]:
@@ -307,13 +364,19 @@ class DocumentRepository:
         doc_type: str | None,
         domain: str | None,
         now: datetime,
-    ) -> None:
+        expected_blob: str | None = None,
+    ) -> bool:
         """Apply LLM-generated metadata, but only into NULL/empty fields
         so that frontmatter-provided values always win.
+
+        When `expected_blob` is passed, the UPDATE is gated on
+        `external_blob = expected_blob`. The external_git reconciler can
+        reindex a path between worker claim and worker write — without
+        the predicate the worker would stamp stale LLM output onto a row
+        whose body is already newer. Returns True iff the row matched.
         """
         async with self.pool.acquire() as conn:
-            await conn.execute(
-                """
+            sql = """
                 UPDATE documents SET
                     summary  = COALESCE(NULLIF(summary, ''), $2, summary),
                     tags     = CASE
@@ -325,9 +388,13 @@ class DocumentRepository:
                     llm_metadata_at = $6,
                     updated_at = $6
                 WHERE id = $1
-                """,
-                doc_id, summary, tags, doc_type, domain, now,
-            )
+            """
+            args: list = [doc_id, summary, tags, doc_type, domain, now]
+            if expected_blob is not None:
+                sql += " AND external_blob = $7"
+                args.append(expected_blob)
+            status = await conn.execute(sql, *args)
+        return status.endswith(" 1")
 
 
 class CollectionRepository:
@@ -337,9 +404,7 @@ class CollectionRepository:
     async def get_or_create(self, vault_id: uuid.UUID, path: str, conn=None) -> uuid.UUID:
         async def _do(c):
             # ON CONFLICT handles the SELECT-then-INSERT race where two
-            # concurrent PUTs both find no row and both INSERT. Pre-fix
-            # the loser raised UniqueViolationError → 500.
-            cid = uuid.uuid4()
+            # concurrent PUTs both find no row and both INSERT.
             name = path.rstrip("/").split("/")[-1]
             row = await c.fetchrow(
                 """
@@ -348,7 +413,7 @@ class CollectionRepository:
                 ON CONFLICT (vault_id, path) DO NOTHING
                 RETURNING id
                 """,
-                cid, vault_id, path, name,
+                uuid.uuid4(), vault_id, path, name,
             )
             if row:
                 return row["id"]
@@ -356,6 +421,11 @@ class CollectionRepository:
                 "SELECT id FROM collections WHERE vault_id = $1 AND path = $2",
                 vault_id, path,
             )
+            if existing is None:
+                raise RuntimeError(
+                    f"collection {path!r} could not be created or found "
+                    f"in vault {vault_id} (concurrent delete?)"
+                )
             return existing["id"]
         if conn is not None:
             return await _do(conn)
@@ -449,12 +519,14 @@ class CollectionRepository:
         async with self.pool.acquire() as acq:
             await acq.execute(sql, collection_id)
 
-    @staticmethod
-    def _like_escape(s: str) -> str:
-        """Escape LIKE metacharacters so user-supplied folder names with
-        `%`, `_`, or `\\` don't widen the match. Paired with
-        `ESCAPE '\\'` in the query."""
-        return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    # ``_like_escape`` used to live here. The same triple-replace also
+    # got copy-pasted into the inline prefix-filter inside
+    # ``list_docs_by_depth`` (and into two other repos). Consolidated
+    # at ``app.util.text.like_escape`` — call sites now go through
+    # that, and this alias keeps the existing ``self._like_escape``
+    # call-pattern working without churn.
+    from app.util.text import like_escape as _like_escape_impl
+    _like_escape = staticmethod(_like_escape_impl)
 
     async def list_docs_under(
         self,
