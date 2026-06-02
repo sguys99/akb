@@ -335,10 +335,14 @@ async def _handle_get(args: dict, uid: str, user: _MCPUser) -> dict:
                 r"\A---\r?\n.*?\r?\n---\r?\n", "", raw, count=1, flags=_re.DOTALL,
             )
             body = stripped
+        from app.services.resource_hash import HASH_ALGORITHM, compute_text_content_hash
         return {
             "title": doc["title"],
             "uri": doc_uri(vault, doc["path"]),
             "version": version,
+            "current_commit": version,
+            "content_hash": compute_text_content_hash(body),
+            "hash_algorithm": HASH_ALGORITHM,
             "content": body,
         }
     doc = await doc_service.get(vault, doc_path)
@@ -361,6 +365,8 @@ async def _handle_update(args: dict, uid: str, user: _MCPUser) -> dict:
         depends_on=args.get("depends_on"),
         related_to=args.get("related_to"),
         message=args.get("message"),
+        expected_commit=args.get("expected_commit"),
+        expected_content_hash=args.get("expected_content_hash"),
     )
     result = await doc_service.update(vault, doc_path, req, agent_id=user.username)
     if not result:
@@ -438,6 +444,7 @@ async def _handle_browse(args: dict, uid: str, user: _MCPUser) -> dict:
         collection=collection,
         depth=args.get("depth", 1),
         content_type=args.get("content_type", "all"),
+        include_hashes=args.get("include_hashes", False),
     )
     include_summary = args.get("include_summary")
     payload = result.model_dump(
@@ -837,7 +844,7 @@ async def _handle_alter_table(args: dict, uid: str, user: _MCPUser) -> dict:
             drop_columns=args.get("drop_columns"),
             rename_columns=args.get("rename_columns"),
         )
-    except NotFoundError as e:
+    except (NotFoundError, ValueError) as e:
         return {"error": str(e)}
 
 
@@ -891,6 +898,14 @@ async def _handle_publish(args: dict, uid: str, user: _MCPUser) -> dict:
         return {"error": f"Unknown resource_type: {resource_type}"}
 
     await check_vault_access(uid, vault_name, required_role="writer")
+    # A table_query publication runs against EVERY vault in
+    # query_vault_names, served to unauthenticated visitors. Authorize
+    # each one — without this a writer on one vault could publish a query
+    # that reads another vault's tables (cross-vault exfiltration).
+    if resource_type == "table_query":
+        for qv in (args.get("query_vault_names") or [vault_name]):
+            if qv != vault_name:
+                await check_vault_access(uid, qv, required_role="writer")
     created_by = uuid.UUID(uid) if uid and uid != _SYSTEM_UID else None
 
     try:
@@ -972,17 +987,22 @@ async def _handle_publications(args: dict, uid: str, user: _MCPUser) -> dict:
 @_h("akb_publication_snapshot")
 async def _handle_publication_snapshot(args: dict, uid: str, user: _MCPUser) -> dict:
     """Create a snapshot of a table_query publication."""
-    await check_vault_access(uid, args["vault"], required_role="writer")
+    access = await check_vault_access(uid, args["vault"], required_role="writer")
     slug = args["slug"]
     pool = await get_pool()
     async with pool.acquire() as conn:
+        # Bind to the authorized vault — without it a writer on `vault`
+        # could snapshot (force-execute) any publication by slug.
         row = await conn.fetchrow(
-            "SELECT id FROM publications WHERE slug = $1", slug,
+            "SELECT id FROM publications WHERE slug = $1 AND vault_id = $2",
+            slug, access["vault_id"],
         )
     if not row:
         return {"error": f"Publication not found: {slug}"}
     try:
-        return await publication_service.create_snapshot(row["id"])
+        return await publication_service.create_snapshot(
+            row["id"], expected_vault_id=access["vault_id"],
+        )
     except publication_service.PublicationError as e:
         return {"error": e.message}
     except Exception as e:
@@ -1091,6 +1111,7 @@ async def _handle_delete_collection(args: dict, uid: str, user: _MCPUser) -> dic
             "doc_count": exc.doc_count,
             "file_count": exc.file_count,
             "sub_collection_count": exc.sub_collection_count,
+            "table_count": exc.table_count,
         }
 
 

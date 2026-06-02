@@ -5,6 +5,374 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.4.1 — 2026-06-02
+
+Connection-pool deadlock on the document write paths under a concurrent
+write burst. Reproduced from an external "E01 multi-vault knowledge
+burst" report (100 PUT + 300 GET returned transport-level "status 0").
+
+### Document writes deadlocked the pool at ≥ `pool_size` concurrent writers
+
+`put`/`update`/`edit`/`delete` each acquired **two** pool connections at
+once: `_path_lock()` held one connection (`lock_conn`, inside a
+transaction holding the `pg_advisory_xact_lock`) for the whole critical
+section, and the body then did a **second** `pool.acquire()` for the
+chunks/relations/events transaction. With `max_size=20`, once 20
+concurrent writers each held a lock connection and then all waited for a
+second connection, none could free one — a textbook hold-and-wait
+deadlock. It only broke when PG's `idle_in_transaction_session_timeout`
+(60s) killed the idle lock transactions, so clients saw 60s hangs →
+`ReadTimeout`. `/livez` stayed green the whole time (it touches neither
+the pool nor the event loop), which is why the failure hid from health
+checks. Reads were collateral: every DB-touching request starved while
+the 20 connections sat frozen.
+
+The trigger is just **20 simultaneous writes to one pod** — a realistic
+bar (a bulk import, or ~20 agents), not only a synthetic stress test.
+
+Fix: each writer now holds **exactly one** pool connection. `_path_lock`
+yields its connection and every DB statement of the critical section
+(conflict pre-check, `get_or_create`, `create`/`update`, chunks,
+relations, events, publication cascade, doc-row delete, collection
+count) runs on that one connection's transaction. `document_repo`'s
+`create`/`update`/`update_hash` gained a `conn=` parameter
+(backward-compatible) so they reuse the caller's connection instead of
+acquiring their own. The pool is now a clean backpressure queue: the
+21st concurrent writer waits for a free connection instead of
+deadlocking. As a bonus, each write is now fully atomic in one
+transaction (doc row + chunks + edges + events commit or roll back
+together). No schema change, no migration.
+
+Verified: a 100-PUT + 300-GET multi-vault burst that returned 0/100 PUT
+and 2/300 GET before now returns 100/100 and 300/300; `test_mcp_e2e`
+76/76, `test_edit_e2e` 37/37, `test_concurrency_repro_e2e` 22/22. Repro
+harness lives at `backend/tests/concurrency/repro_e01_multivault.py`.
+
+## 0.4.0 — 2026-06-02
+
+License change: **PolyForm Noncommercial 1.0 → Business Source License
+1.1**. No runtime contract change; this release exists to mark the
+license transition cleanly.
+
+The BSL 1.1 ships with a 100 Named Seats Additional Use Grant — small
+commercial deployments that were previously forbidden are now
+explicitly permitted, while large-scale or third-party-hosting use
+still requires a commercial license. Each release converts
+automatically to Apache License 2.0 four years after its first public
+distribution.
+
+See [LICENSE](../LICENSE) for the load-bearing text and
+[LICENSE-CHANGE.md](../LICENSE-CHANGE.md) for the rationale and FAQ.
+
+Releases ≤ 0.3.6 remain under PolyForm NC 1.0 as originally distributed.
+
+## 0.3.6 — 2026-05-28
+
+The "P2" cut of the functional/logic review — four data-integrity /
+contract bugs plus one latent publication-cascade bug. Each was
+designed from a current-code blueprint (adversarially checked) and
+verified with a unit test. No schema change, no migration.
+
+### Archived vaults are now genuinely read-only (both directions fixed)
+
+The archive contract was broken in two opposing ways:
+- **Writes weren't blocked.** `check_vault_access` only enforced the
+  archived guard for `required_role == "writer"`, and the akb_sql write
+  surface gated at `reader` then relied on PG ACL — which has no archive
+  concept. A writer/admin/owner could still `INSERT/UPDATE/DELETE` (and
+  `drop_table`/`alter_table`) on an archived vault.
+- **Reads broke after reconcile.** `_reconcile_vault_roles` fetched only
+  non-archived vaults and then *dropped* every group role not in that
+  set, so on the next reconcile (startup + periodic) an archived vault's
+  reader role + table GRANTs were dropped and `akb_sql` SELECT returned
+  42501 for everyone incl. the owner. `_diff_vaults` used a different
+  vault set, so diff/reconcile never converged (`is_clean()` never True).
+
+One coherent model now: archived = READ-ONLY. The write block lives in
+the app layer — `execute_sql` rejects any non-SELECT against an archived
+referenced vault, and `check_vault_access`'s guard fires for `writer`
+AND `admin` (so create/alter/drop table are refused), positioned before
+the admin/owner short-circuits so even a system admin is blocked. PG
+write grants are intentionally preserved (so unarchive is instant), and
+the reconciler now keeps archived vaults' roles by fetching ALL vaults —
+matching `_diff_vaults`. `delete_vault` passes a new `allow_archived=True`
+so you can still delete an archived vault.
+
+### `alter_table` reserved-column guard
+
+`create_table` rejected `id`/`created_at`/`updated_at`/`created_by`, but
+`alter_table` didn't — so `drop_columns=["id"]` dropped the table's
+primary key, and `add_columns=[{name:"created_at",type:"text"}]` made
+the registry lie about a bookkeeping column's type. A shared
+`_validate_column_name` now guards add/drop/rename in both paths
+(reserved names + `^[a-z][a-z0-9_]*$` shape so the registry name can't
+diverge from its `safe_ident` PG identity), with the MCP handler
+surfacing the `ValueError` as a friendly error.
+
+### Collection delete handles tables
+
+`CollectionService.delete` enumerated only documents and files, never
+`vault_tables` — so a collection containing only a table passed the
+empty-mode check and was silently destroyed, and even recursive delete
+left the table (re-homed to vault root via `collection_id`
+ON DELETE SET NULL). It now lists tables under the prefix (`FOR UPDATE`),
+counts them in the empty-mode 409, and in recursive mode tears each one
+down (dynamic PG table + chunk outbox + registry row + edges) inside the
+same transaction, returning a `deleted_tables` count.
+
+### Embedding response paired by `index`, not array order
+
+`_embed_call` zipped the embeddings response to its inputs by position.
+The OpenAI embeddings contract pairs each output to its input via the
+item's `index` field; an OpenAI-compatible gateway that reassembles a
+batched response out of order would silently attach vectors to the wrong
+chunks. The response is now reordered by `index` with a completeness
+assertion (`{0..n-1}`); a malformed/gapped index set is treated as a
+transient error so the worker retries.
+
+### Fix: `delete_publications_for_document` UUID branch built a legacy URI
+
+When called with a doc UUID (vs a canonical URI), it materialized
+`akb://V/doc/{path}` (pre-0.3.0 legacy shape) which never matched the
+canonical `akb://V/coll/{coll}/doc/{name}` stored in
+`publications.resource_uri` — so the cascade silently left orphan
+publications. Now built via `doc_uri`. (Dormant — the only live caller
+passes a canonical URI and the real doc-delete path already uses
+`doc_uri` — but a latent landmine, now closed.)
+
+### Tests
+
+- `test_invariants_unit.py`: archived read-only (write blocked / read
+  works), alter reserved-column guard (PK survives), collection delete
+  table teardown + empty-mode reject, embed index reorder, and the
+  publication-cascade canonical match.
+- Modernized two stale `test_collection_*` cases that still inserted into
+  the `vault_files.collection` column dropped in migration 020.
+
+Regression: `test_mcp_e2e` 76/76, `test_pg_rbac_e2e` 50/50,
+`repro_pub_security` 4/4 SAFE, unit suite green. Archived-vault model
+verified end-to-end (read 200, write/DDL refused).
+
+## 0.3.5 — 2026-05-28
+
+Permanently fixes the recurring migration-026 boot crash and stops new
+legacy-shape edges from being created. The 0.3.3 guard only skipped 026
+when no legacy doc URIs remained; it did not make the rewrite itself
+safe. Legacy edges kept being (re)created by an external caller, so
+every cold restart re-tripped the
+`edges_source_uri_target_uri_relation_type_key` UNIQUE violation and the
+backend crash-looped (twice now in production, each needing a manual DB
+cleanup).
+
+### Fix — migration 026 is now conflict-safe (F2)
+
+Before each rewrite of an `edges` URI column, 026 now DELETEs legacy
+rows whose canonical-rewritten form would collide with an existing row,
+preferring to keep the canonical row (or the smaller id among legacy
+twins). Applied to the doc-shape regex rewrite and the table/file
+temp-table rewrites, for both `source_uri` and `target_uri`. The
+migration is now idempotent AND conflict-safe regardless of the data
+state — verified by seeding a legacy↔canonical twin and running 026
+twice with no error. (This is the exact cleanup that previously had to
+be done by hand on every crash.)
+
+### Fix — `akb_link` stores canonical URIs (F1, root cause)
+
+`kg_service.link_resources` inserted the caller-supplied `source_uri` /
+`target_uri` verbatim. An external tool calling `akb_link` with a
+legacy-shaped but parseable URI (`akb://V/doc/{coll}/{name}`) therefore
+persisted a legacy edge, which 026 then collided on. Both endpoints are
+now canonicalized from their parsed parts (new
+`kg_service.canonicalize_resource_uri` helper) before insert, so the
+explicit-link path can no longer introduce legacy edges. (Edge
+extraction via `_store_edge` already canonicalized; this closes the
+remaining writer.)
+
+### Operator notes
+
+- No schema change.
+- After this release, a cold restart no longer crashes even if legacy
+  edges exist — 026 self-heals. Existing prod legacy edges are
+  rewritten/deduped on the next boot.
+- The external tool that was emitting legacy `akb://V/doc/{coll}/{name}`
+  link URIs (observed in the `pdf-parser-test` vault) should still be
+  updated to send canonical URIs; AKB now tolerates either.
+
+## 0.3.4 — 2026-05-28
+
+Security + data-integrity patch. Findings came out of a full
+functional/logic review of the backend (20-subsystem multi-agent pass,
+55 confirmed findings); this release lands the highest-priority cut.
+Each fix was reproduced in the audit stack BEFORE the change and
+re-verified SAFE after. No schema change, no migration.
+
+### Security — publication public surface (unauthenticated)
+
+Publications are served at `/api/v1/public/{slug}` with no auth, so
+these were directly exploitable by anyone with the URL.
+
+- **Public `table_query` ran as the privileged pool role.**
+  `resolve_table_query_publication` executed the canned SQL on the
+  default service-role connection with only `SET TRANSACTION READ ONLY`
+  — no `SET LOCAL ROLE`, no table ACL. A publication such as
+  `SELECT password_hash FROM users` / `SELECT token_hash FROM tokens` /
+  `SELECT * FROM vt_othervault__secret` returned rows to unauthenticated
+  visitors (verified: `SELECT count(*) FROM users` → 59 rows;
+  `SELECT current_user` → `akb`). Now the query runs under the
+  publication CREATOR's PG role (`SET LOCAL ROLE akb_user_<created_by>`),
+  so PG returns 42501 for anything the creator could not read via
+  `akb_sql`. Publications without a recorded creator fail closed (403).
+  Adds `s.created_by` to the resolve SELECT.
+- **`akb_publish` / `create_publication_route` now authorize every vault
+  in `query_vault_names`,** not just the route vault — a writer on one
+  vault could otherwise publish a query reading another vault's tables.
+- **`delete_publication` IDOR fixed.** The REST delete route bound the
+  delete only to the publication id, ignoring the route vault, so a
+  writer on any vault could delete any publication by id. Now scoped to
+  `WHERE id=$1 AND vault_id=$2`; returns 404 otherwise.
+- **`create_snapshot` cross-vault fixed.** Loaded the publication by id
+  with no vault filter (REST and MCP), letting a writer on vault A
+  force-execute and snapshot vault B's publication. Now binds to the
+  authorized vault and rejects with 404 before running the query / S3
+  write.
+
+### Data integrity / correctness
+
+- **`delete_vault` orphaned file-chunk vectors when S3 is configured.**
+  The 0.3.2 file-chunk outbox enqueue ran AFTER the early
+  `DELETE FROM vault_files` (which only fires when S3 is configured), so
+  it read zero rows and every file chunk CASCADE-dropped from PG without
+  a `vector_delete_outbox` entry — permanent orphan points. The 0.3.2
+  unit test missed it because the audit stack has no S3. File ids are now
+  captured (`SELECT id, s3_key`) and enqueued BEFORE the delete.
+- **`FileService.delete` swallowed chunk-delete failures.** The
+  `delete_file_chunks` call was wrapped in a `try/except` that logged and
+  continued, defeating the 03-F1 contract (the enqueue is meant to RAISE
+  so a failure rolls back the file delete). Removed; failures now roll
+  back the whole delete like the document/table/vault paths.
+- **Collection-scoped search 500'd.** The search ACL prefilter's
+  file-candidate branch filtered on `vault_files.collection`, a column
+  dropped in migration 020 (replaced by `collection_id`). Any
+  `search?...&collection=X` with the default `doc_type` raised
+  UndefinedColumn and 500'd the whole request. Now joins `collections`
+  on `collection_id` and prefix-matches `c.path`, same as the documents
+  branch.
+
+### Tests
+
+- `backend/tests/concurrency/repro_pub_security.sh` — before/after
+  VULNERABLE↔SAFE probes for the publication authz holes + the search
+  crash.
+- `test_invariants_unit.py`: `test_inv7b` (delete_vault file outbox with
+  S3 configured) and `test_p1_2` (FileService.delete rollback).
+
+Regression: `test_mcp_e2e` 76/76, `test_invariants.sh` 9/9, unit 6/6.
+Legit flows reverified (own-table publication view, authorized
+multi-vault publish, owner delete/snapshot).
+
+## 0.3.3 — 2026-05-28
+
+Hotfix on top of 0.3.2. The 0.3.2 image failed to start on existing
+prod-shaped state: migration 026 (`uri_collection_prefix`, original
+0.3.0 work) re-ran on every backend boot and tripped a
+`UniqueViolationError` on the second pass.
+
+### Cause
+
+`026_uri_collection_prefix._run` rewrites legacy `akb://V/doc/{coll}/{name}`
+URIs to the canonical `akb://V/coll/{coll}/doc/{name}` shape across
+`edges`, `publications`, `events`. After the first deploy on a vault
+the rewrite is complete, but the migration is still in the registry
+that runs on every startup. New edges written between 0.3.0 and 0.3.2
+ended up with the canonical shape directly; the second pass of the
+rewrite would map those onto each other, colliding on
+`UNIQUE (source_uri, target_uri, relation_type)`.
+
+This is an idempotency bug in the original 0.3.0 migration, not in
+the 0.3.2 fix. It surfaced now because nothing had been forcing a
+backend rolling restart on these databases since 0.3.0 went out.
+
+### Fix
+
+`026._run` now starts with a cheap probe: a single SQL that checks
+whether any URI column still matches the legacy shape. If none does,
+the migration logs "no legacy URI shapes remain; skipping" and
+returns. The probe is `LIMIT 1` so it's O(1) once the indexes
+warm up.
+
+### Notes for operators
+
+- 0.3.2 was tagged + released but the image never made it past
+  startup on any cluster that had previously processed migration
+  026. Use 0.3.3.
+- No schema change. The probe is read-only.
+- 0.3.2 changelog body is preserved below for reference.
+
+## 0.3.2 — 2026-05-28
+
+Follow-up patch to 0.3.1. One new finding surfaced while writing the
+invariant test suite added in 0.3.1, plus the suite itself.
+
+### Fix: `delete_vault` enqueues file chunks for vector-store deletion
+
+`access_service.delete_vault` already iterated `vault_tables` and ran
+`_drop_source_chunks_with_outbox(conn, "table", id)` so the
+vector-store points for table-metadata chunks got enqueued into
+`vector_delete_outbox` before the cascade fired. The matching loop
+over `vault_files` was missing.
+
+Effect of the gap: `chunks.vault_id ON DELETE CASCADE` still removed
+the file chunks from PG when the vaults row went, but
+`vector_delete_outbox` doesn't ride the cascade, so the vector store
+kept the points. Production vector stores accumulated one orphan
+point per chunk per file in every deleted vault.
+
+Why the audit-v2 pass missed it: the `delete_vault_chunks` docstring
+claimed "tables/files CASCADE through their own vault_tables /
+vault_files FKs at vault-drop time — their chunk cleanup is handled
+in the service delete hooks." Half-true: vault_tables/vault_files
+rows do cascade, but `chunks.source_id` has no FK (polymorphic
+source), and the "service delete hooks" only existed for tables.
+
+Fix mirrors the table loop inside the same outer transaction so the
+outbox INSERT commits atomically with the chunks DELETE.
+
+Surfaced by a multi-assertion invariant test (`post == 0 AND outbox
+== 3`) — the single-condition "no orphan chunks" assertion would have
+passed because the cascade does its job in PG; only the second
+assertion noticed the missing outbox row.
+
+### Tests: concurrency invariant suite
+
+New `backend/tests/concurrency/` with two complementary tracks:
+
+- `test_invariants.sh` — bombardment + PG ground-truth shell suite.
+  Hits the audit Docker stack with N concurrent curl clients per
+  invariant, then asserts the post-condition by querying PG via
+  `docker exec`. Covers INV-1, INV-2, INV-4, INV-8, INV-9, INV-10
+  (cross- + same-vault), INV-11, INV-12. 9/9 pass.
+- `test_invariants_unit.py` — pytest for the four invariants that
+  don't fit a curl-bombardment shape (INV-3 `end_session` dedup,
+  INV-5 BM25 `try_advisory_lock`, INV-6 metadata stale guard, INV-7
+  `delete_vault` orphan chunks). 4/4 pass.
+
+Together the suite verifies every Tier 0 / Tier 1 fix from 0.3.1
+plus the new 0.3.2 fix above (13/13 invariants).
+
+### Notes for operators
+
+- No schema change. No migration.
+- Existing vaults with file-heavy history have already lost
+  outbox rows for any file chunks deleted before this patch — those
+  orphan vector-store points are not recoverable from PG state and
+  would need a separate sweep job to reconcile (out of scope here).
+- Running the new invariant suite locally:
+  ```
+  AKB_URL=http://localhost:8001 bash backend/tests/concurrency/test_invariants.sh
+  AKB_TEST_DSN=postgresql://akb:akb@localhost:5433/akb \
+    uv run pytest backend/tests/concurrency/test_invariants_unit.py -v
+  ```
+
 ## 0.3.1 — 2026-05-27
 
 Second-round concurrency/atomicity audit. 54 findings across six

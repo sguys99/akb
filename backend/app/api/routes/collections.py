@@ -37,10 +37,13 @@ async def browse_vault(
             "-1 = unbounded entire subtree."
         ),
     ),
+    include_hashes: bool = Query(False, description="Include content hash/version metadata for documents and files."),
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     await check_vault_access(user.user_id, vault, required_role="reader")
-    return await doc_service.browse(vault, collection=collection, depth=depth)
+    return await doc_service.browse(
+        vault, collection=collection, depth=depth, include_hashes=include_hashes,
+    )
 
 
 @router.post("/collections/{vault}", summary="Create an empty collection")
@@ -102,5 +105,6 @@ async def delete_collection(
                 "doc_count": exc.doc_count,
                 "file_count": exc.file_count,
                 "sub_collection_count": exc.sub_collection_count,
+                "table_count": exc.table_count,
             },
         )
