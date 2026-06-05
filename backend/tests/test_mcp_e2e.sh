@@ -293,22 +293,6 @@ BROWSE_KEEP=$(mcp_call akb_browse "{\"vault\":\"$VAULT\"}" | mcp_result)
 HAS_KEEP=$(echo "$BROWSE_KEEP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(sum(1 for i in d.get('items', []) if i.get('name') == 'keepempty' and i.get('type') == 'collection'))" 2>/dev/null)
 [ "$HAS_KEEP" = "1" ] && pass "empty collection survives last-doc delete" || fail "empty-is-valid" "keepempty not found in browse"
 
-# ── 10. Memory via MCP ───────────────────────────────────────
-echo ""
-echo "▸ 10. Memory via MCP"
-
-R=$(mcp_call akb_remember '{"content":"MCP test memory","category":"learning"}' | mcp_result)
-MEM_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['memory_id'])" 2>/dev/null)
-[ -n "$MEM_ID" ] && pass "akb_remember ($MEM_ID)" || fail "akb_remember" "no id"
-
-R=$(mcp_call akb_recall '{}' | mcp_result)
-MEM_COUNT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['total'])" 2>/dev/null)
-[ "$MEM_COUNT" -ge 1 ] 2>/dev/null && pass "akb_recall: $MEM_COUNT memories" || fail "akb_recall" "expected >=1"
-
-R=$(mcp_call akb_forget "{\"memory_id\":\"$MEM_ID\"}" | mcp_result)
-FORGOT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['forgotten'])" 2>/dev/null)
-[ "$FORGOT" = "True" ] && pass "akb_forget" || fail "akb_forget" "not deleted"
-
 # ── 11. Tables via MCP ───────────────────────────────────────
 echo ""
 echo "▸ 11. Tables via MCP"
@@ -355,7 +339,7 @@ print('yes' if t and any(c.get('name')=='product' for c in t.get('columns', []))
 # Wrong column name → fuzzy hint (issue #36)
 R=$(mcp_call akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"SELECT * FROM mcp_items WHERE producct = 'Widget'\"}" | mcp_result)
 HINT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('hint',''))" 2>/dev/null)
-AVAIL=$(echo "$R" | python3 -c "import sys,json; print(','.join(json.load(sys.stdin).get('available_columns',[])))" 2>/dev/null)
+AVAIL=$(echo "$R" | python3 -c "import sys,json; print(','.join(json.load(sys.stdin).get('details',{}).get('available_columns',[])))" 2>/dev/null)
 case "$HINT" in
   *"Did you mean"*"product"*) pass "akb_sql wrong column suggests 'product'" ;;
   *) fail "akb_sql column hint" "got hint=$HINT, avail=$AVAIL" ;;
@@ -374,6 +358,30 @@ R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\",\"content_type\":\"tables\"}" | m
 TBL_COUNT=$(echo "$R" | python3 -c "import sys,json; print(len([i for i in json.load(sys.stdin)['items'] if i['type']=='table']))" 2>/dev/null)
 [ "$TBL_COUNT" -ge 1 ] 2>/dev/null && pass "akb_browse(tables): $TBL_COUNT" || fail "akb_browse tables" "expected >=1"
 
+# ── 11b. Browse advertises sql_name + rewriter accepts it ─────
+# Issues #110 / #111: browse must expose the SQL identifier the
+# client should pass to akb_sql, and the rewriter must accept it.
+# `_TABLE_NAME_RE` currently rejects hyphen / non-ASCII at create
+# time, so the interesting legacy cases can't be reproduced from
+# scratch via the MCP surface — those are covered by
+# test_table_identifier_unit. Here we confirm the ASCII contract:
+# `sql_name` is present, equals the queryable identifier, and
+# round-trips through the rewriter.
+R=$(mcp_call akb_browse "{\"vault\":\"$VAULT\",\"content_type\":\"tables\"}" | mcp_result)
+ASCII_SQL=$(echo "$R" | python3 -c "import sys,json; print(next((i.get('sql_name') for i in json.load(sys.stdin)['items'] if i.get('name')=='mcp_items'), 'MISSING'))" 2>/dev/null)
+[ "$ASCII_SQL" = "mcp_items" ] && pass "browse exposes sql_name (ascii: $ASCII_SQL)" || fail "browse sql_name" "got: $ASCII_SQL"
+
+R=$(mcp_call akb_sql "{\"vault\":\"$VAULT\",\"sql\":\"SELECT COUNT(*) as cnt FROM $ASCII_SQL\"}" | mcp_result)
+CNT=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('items',[{}])[0].get('cnt','MISSING'))" 2>/dev/null)
+[ -n "$CNT" ] && [ "$CNT" != "MISSING" ] && pass "akb_sql round-trip via sql_name" || fail "akb_sql round-trip" "got: $R"
+
+# 0.5.7: REST `GET /tables/{vault}` must mirror the MCP shape and
+# include `sql_name` too — issue #110 originally only fixed the MCP
+# path, leaving direct REST clients to guess the sanitisation rule.
+REST_SQL=$(curl -sk "$BASE_URL/api/v1/tables/$VAULT" -H "Authorization: Bearer $PAT" \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); print(next((t.get('sql_name','MISSING') for t in d.get('items',[]) if t.get('name')=='mcp_items'), 'MISSING'))" 2>/dev/null)
+[ "$REST_SQL" = "mcp_items" ] && pass "REST /tables exposes sql_name" || fail "REST sql_name" "got: $REST_SQL"
+
 # ── 12. Publish via MCP ──────────────────────────────────────
 echo ""
 echo "▸ 12. Publish via MCP"
@@ -391,8 +399,8 @@ PUB_TITLE=$(curl -sk "$BASE_URL/api/v1/public/$PUB_SLUG" 2>/dev/null | python3 -
 [ "$PUB_TITLE" = "Pub Test" ] && pass "Public access works" || fail "Public access" "wrong title: $PUB_TITLE"
 
 R=$(mcp_call akb_unpublish "{\"uri\":\"$PUB_DOC_URI\"}" | mcp_result)
-UNPUB=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['published'])" 2>/dev/null)
-[ "$UNPUB" = "False" ] && pass "akb_unpublish" || fail "akb_unpublish" "expected False"
+DELETED=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['deleted'])" 2>/dev/null)
+[ "$DELETED" -ge 1 ] 2>/dev/null && pass "akb_unpublish (deleted=$DELETED)" || fail "akb_unpublish" "expected deleted≥1 got $DELETED"
 
 # ── 13. Second-user setup (for access-control + cross-user tests below) ─
 echo ""

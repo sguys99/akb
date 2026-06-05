@@ -14,6 +14,7 @@ from app.exceptions import ConflictError, ForbiddenError, NotFoundError, Validat
 from app.repositories.events_repo import emit_event
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import vault_uri
+from app.util.errors import NOT_FOUND, err
 
 logger = logging.getLogger("akb.access")
 
@@ -799,7 +800,7 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
     async with pool.acquire() as conn:
         vault = await conn.fetchrow("SELECT id FROM vaults WHERE name = $1", vault_name)
         if not vault:
-            return {"error": f"Vault not found: {vault_name}"}
+            return err(f"Vault not found: {vault_name}", code=NOT_FOUND)
         vault_id = vault["id"]
 
         # Delete S3 files BEFORE the DB cascade — this part cannot be
@@ -857,7 +858,6 @@ async def delete_vault(user_id: str, vault_name: str) -> dict:
             await conn.execute("DELETE FROM vault_tables WHERE vault_id = $1", vault_id)
 
             await conn.execute("DELETE FROM todos WHERE vault_id = $1", vault_id)
-            await conn.execute("DELETE FROM sessions WHERE vault_id = $1", vault_id)
             await conn.execute("DELETE FROM documents WHERE vault_id = $1", vault_id)
             await conn.execute("DELETE FROM collections WHERE vault_id = $1", vault_id)
             await conn.execute("DELETE FROM vault_access WHERE vault_id = $1", vault_id)
@@ -888,8 +888,8 @@ async def delete_user_account(user_id: str) -> dict:
          touched: todos they authored/are assigned, vault_access grants they
          made, publications they created. SET NULL rather than deleting the
          artifacts — those belong to other users' vaults.
-      3. DELETE users row. CASCADE clears `memories`, `tokens`, and
-         `vault_access` rows keyed on user_id.
+      3. DELETE users row. CASCADE clears `tokens` and `vault_access`
+         rows keyed on user_id.
     """
     uid = uuid.UUID(user_id)
     pool = await get_pool()
@@ -915,7 +915,7 @@ async def delete_user_account(user_id: str) -> dict:
         await conn.execute("UPDATE publications SET created_by = NULL WHERE created_by = $1", uid)
         await conn.execute("UPDATE todos SET assignee_id = NULL WHERE assignee_id = $1", uid)
         await conn.execute("UPDATE todos SET created_by = NULL WHERE created_by = $1", uid)
-        # CASCADE handles memories, tokens, vault_access.user_id
+        # CASCADE handles tokens + vault_access.user_id
         await conn.execute("DELETE FROM users WHERE id = $1", uid)
 
     # PG-native RBAC: drop akb_user_<uid>. Owned vault group roles

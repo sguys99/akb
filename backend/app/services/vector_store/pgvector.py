@@ -28,6 +28,7 @@ Sparse storage shape is selected at construction time:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import re
 import uuid
@@ -36,7 +37,19 @@ from typing import Literal
 
 import asyncpg
 
-from .base import VectorHit, VectorStoreUnavailable
+from .base import VectorHit, VectorStoreUnavailable, has_dense
+
+
+def _advisory_lock_key(schema: str) -> int:
+    """Stable PG ``bigint`` key for the per-schema ensure_collection
+    advisory lock. Cross-process: any worker computing the same
+    schema string gets the same key. Signed so it fits the PG
+    ``bigint`` parameter that ``pg_advisory_xact_lock`` expects."""
+    digest = hashlib.blake2b(
+        f"akb:vector_store:ensure_collection:{schema}".encode("utf-8"),
+        digest_size=8,
+    ).digest()
+    return int.from_bytes(digest, "big", signed=True)
 
 logger = logging.getLogger("akb.vector_store.pgvector")
 
@@ -169,13 +182,36 @@ class PgvectorStore:
                 yield c
 
     async def ensure_collection(self, *, conn=None) -> None:
-        """Idempotent schema creation. Only the first call hits the DB.
+        """Idempotent schema creation, race-free across processes.
 
-        CREATE statements run on a dedicated pooled conn outside any
-        outer transaction, so the table is committed before the lock
-        releases — concurrent peers that take the fast path can rely
-        on the table being globally visible. `conn` is accepted for
-        driver-interface parity (base.py) and ignored.
+        Three layers of guards, in order:
+
+        1. **Instance flag** — ``_ensured_collection`` short-circuits
+           every call after the first successful one within this
+           process. The hot path is one bool read.
+        2. **asyncio.Lock** — serializes concurrent callers inside the
+           same event loop (e.g. lifespan startup + a request handler
+           racing on a cold start). The second caller waits, sees the
+           flag, returns.
+        3. **PG advisory transaction lock** — serializes across worker
+           processes / pods sharing the same database. A peer that's
+           mid-rebuild holds the lock; we block until it commits (or
+           rolls back), then re-check inside the lock and skip the
+           build if the peer already produced the artifact.
+
+        Layer (3) was missing pre-0.6.4. The 0.6.2 rebuild of
+        `idx_vi_chunks_dense` (partial HNSW) could race against
+        itself: a search request that timed out (504) cancelled the
+        in-flight CREATE INDEX before it committed; the next request
+        saw ``_ensured_collection=False`` and re-issued, ad infinitum.
+        Even at a single uvicorn worker the asyncio cancel made it
+        look multi-process. Cross-process advisory lock + atomic
+        index swap (build under temp name → DROP legacy → RENAME)
+        below makes the rebuild forward-progress-safe.
+
+        `conn` is accepted for driver-interface parity (base.py) and
+        ignored — we always acquire our own pool conn so the schema
+        commit is independent of any caller transaction state.
         """
         if self._ensured_collection:
             return
@@ -186,7 +222,15 @@ class PgvectorStore:
                 pool = await self._pool()
                 async with pool.acquire() as c:
                     await self._ensure_codec(c)
-                    await self._do_ensure(c)
+                    async with c.transaction():
+                        # advisory_xact_lock auto-releases on tx end
+                        # (commit OR rollback OR conn close), so a
+                        # cancelled CREATE INDEX can't strand the lock.
+                        await c.execute(
+                            "SELECT pg_advisory_xact_lock($1)",
+                            _advisory_lock_key(self._schema),
+                        )
+                        await self._do_ensure(c)
             except asyncpg.PostgresError as e:
                 raise VectorStoreUnavailable(f"schema setup failed: {e}") from e
             self._ensured_collection = True
@@ -195,6 +239,9 @@ class PgvectorStore:
         await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
         await conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{self._schema}"')
 
+        # `dense` is nullable: the embed worker upserts sparse-only points
+        # when the embedding API is unavailable, and the dense leg of
+        # hybrid_search filters them out via the partial HNSW index below.
         if self._sparse_shape == "arrays":
             await conn.execute(
                 f"""
@@ -205,7 +252,7 @@ class PgvectorStore:
                     section_path    TEXT,
                     content         TEXT NOT NULL,
                     chunk_index     INTEGER NOT NULL,
-                    dense           vector({self._dense_dim}) NOT NULL,
+                    dense           vector({self._dense_dim}),
                     sparse_terms    BIGINT[] NOT NULL DEFAULT '{{}}',
                     sparse_weights  REAL[]   NOT NULL DEFAULT '{{}}',
                     indexed_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -222,7 +269,7 @@ class PgvectorStore:
                     section_path    TEXT,
                     content         TEXT NOT NULL,
                     chunk_index     INTEGER NOT NULL,
-                    dense           vector({self._dense_dim}) NOT NULL,
+                    dense           vector({self._dense_dim}),
                     indexed_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
                 """
@@ -250,6 +297,13 @@ class PgvectorStore:
                 """
             )
 
+        # Existing deployments may have `dense` from the pre-0.6.2
+        # NOT NULL era. Drop the constraint idempotently so the
+        # sparse-only fallback can actually store a NULL.
+        await conn.execute(
+            f'ALTER TABLE "{self._schema}".chunks ALTER COLUMN dense DROP NOT NULL'
+        )
+
         # Common indexes (both shapes).
         await conn.execute(
             f"""
@@ -257,14 +311,71 @@ class PgvectorStore:
                 ON "{self._schema}".chunks (source_id)
             """
         )
-        # HNSW for dense KNN. m=16, ef_construction=64 are pgvector's
-        # defaults and serve us well at <1M points.
+        # HNSW for dense KNN, partial on `WHERE dense IS NOT NULL` so
+        # sparse-only points (BM25 fallback) don't pollute the dense leg.
+        # Inspect `pg_index.indpred` rather than the textual
+        # `pg_indexes.indexdef`: indpred is non-NULL iff the index has a
+        # WHERE clause, format-agnostic across PG versions.
+        idx_state = await conn.fetchrow(
+            """
+            SELECT i.indpred IS NULL AS is_legacy_full
+              FROM pg_index i
+              JOIN pg_class c     ON c.oid = i.indexrelid
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = $1
+               AND c.relname = 'idx_vi_chunks_dense'
+            """,
+            self._schema,
+        )
+
+        if idx_state is None:
+            # Fresh schema — no index yet. Build the partial form
+            # directly under the canonical name.
+            await self._build_partial_hnsw(conn, target_name="idx_vi_chunks_dense")
+        elif idx_state["is_legacy_full"]:
+            # Pre-0.6.2 legacy full HNSW. Atomic swap so the index is
+            # never absent: build the new partial under a temp name,
+            # then DROP legacy + RENAME inside the same transaction
+            # holding the advisory lock. If the build fails (OOM, /dev/shm
+            # too small, cancelled), the legacy index stays in place
+            # and search keeps working — operator just sees the swap
+            # didn't happen yet.
+            await self._build_partial_hnsw(conn, target_name="idx_vi_chunks_dense_new")
+            await conn.execute(
+                f'DROP INDEX "{self._schema}".idx_vi_chunks_dense'
+            )
+            await conn.execute(
+                f'ALTER INDEX "{self._schema}".idx_vi_chunks_dense_new '
+                f'RENAME TO idx_vi_chunks_dense'
+            )
+        # else: partial index already in place — no-op.
+
+    async def _build_partial_hnsw(self, conn, *, target_name: str) -> None:
+        """Build the partial HNSW dense index under ``target_name``.
+
+        Bumps ``maintenance_work_mem`` for this session: at our scale
+        (a few hundred K chunks at 1024-dim) HNSW's graph-construction
+        memory peaks well above the PG default 64MB. With the default
+        we have observed `could not resize shared memory segment ...
+        No space left on device` errors that abort the CREATE INDEX
+        — and a half-built index leaves the schema with `dense_idx`
+        absent, sending the dense leg of every search to a seq scan.
+
+        2GB chosen empirically as the largest value that comfortably
+        fits in the 4GB `/dev/shm` allocated to the postgres pod by
+        ``deploy/k8s/postgres.yaml`` while leaving headroom for
+        concurrent normal workload. Operators on much larger corpora
+        (multi-M chunks) can either raise the pod's `/dev/shm` and
+        this constant in lockstep, or wait for a future driver flag.
+        """
+        await conn.execute("SET LOCAL maintenance_work_mem = '2GB'")
         await conn.execute(
             f"""
-            CREATE INDEX IF NOT EXISTS idx_vi_chunks_dense
+            CREATE INDEX "{target_name}"
                 ON "{self._schema}".chunks
                 USING hnsw (dense vector_cosine_ops)
                 WITH (m = 16, ef_construction = 64)
+                WHERE dense IS NOT NULL
             """
         )
 
@@ -287,7 +398,7 @@ class PgvectorStore:
         content: str,
         section_path: str | None,
         chunk_index: int,
-        dense: list[float],
+        dense: list[float] | None,
         sparse_indices: list[int],
         sparse_values: list[float],
         source_type: str,
@@ -298,7 +409,12 @@ class PgvectorStore:
         sid = uuid.UUID(str(source_id))
         # `dense` goes through pgvector's binary codec — list[float]
         # straight into asyncpg's bind. No text literal, no `::vector`
-        # cast needed.
+        # cast needed. `None` (sparse-only fallback when the embed API
+        # was unavailable) becomes a NULL row and is excluded from the
+        # partial HNSW index by the WHERE clause above.
+        # `list(dense)` is a defensive copy: the caller may reuse the
+        # list across batches and asyncpg binds by reference.
+        dense_param: list[float] | None = list(dense) if has_dense(dense) else None
         try:
             async with self._conn(conn) as c:
                 if self._sparse_shape == "arrays":
@@ -321,7 +437,7 @@ class PgvectorStore:
                             indexed_at     = NOW()
                         """,
                         cid, source_type, sid, section_path or "",
-                        content, int(chunk_index), list(dense),
+                        content, int(chunk_index), dense_param,
                         list(sparse_indices), [float(v) for v in sparse_values],
                     )
                 else:  # posting
@@ -341,7 +457,7 @@ class PgvectorStore:
                             indexed_at   = NOW()
                         """,
                         cid, source_type, sid, section_path or "",
-                        content, int(chunk_index), list(dense),
+                        content, int(chunk_index), dense_param,
                     )
                     # Replace posting rows for this chunk.
                     await c.execute(
@@ -469,12 +585,15 @@ class PgvectorStore:
         limit: int,
     ) -> list[str]:
         # Binary codec → list[float] passes through directly.
+        # `WHERE dense IS NOT NULL` mirrors the partial HNSW index above —
+        # sparse-only points (embed API was down when they were indexed)
+        # contribute only to the sparse leg, never to the dense KNN.
         if src_uuids:
             rows = await conn.fetch(
                 f"""
                 SELECT chunk_id::text AS chunk_id
                 FROM "{self._schema}".chunks
-                WHERE source_id = ANY($2::uuid[])
+                WHERE source_id = ANY($2::uuid[]) AND dense IS NOT NULL
                 ORDER BY dense <=> $1
                 LIMIT $3
                 """,
@@ -485,6 +604,7 @@ class PgvectorStore:
                 f"""
                 SELECT chunk_id::text AS chunk_id
                 FROM "{self._schema}".chunks
+                WHERE dense IS NOT NULL
                 ORDER BY dense <=> $1
                 LIMIT $2
                 """,

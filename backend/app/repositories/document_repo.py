@@ -8,6 +8,7 @@ from datetime import datetime
 import asyncpg
 
 from app.exceptions import ConflictError
+from app.util.text import like_escape
 from app.utils import dumps_jsonb
 
 
@@ -82,6 +83,18 @@ class DocumentRepository:
                 # (vault_id, path) is the only UNIQUE constraint that callers
                 # can collide on. Surface it as a 409 instead of a 500.
                 raise ConflictError(f"Document already exists at path: {path}") from e
+            except asyncpg.ForeignKeyViolationError as e:
+                # The parent collection (or vault) was deleted out from under
+                # this insert — a concurrent collection-retirement / vault-delete
+                # race: get_or_create observed the collection, then a DELETE
+                # removed it before this INSERT committed. `collection_id` is
+                # ON DELETE SET NULL, so the *delete* side re-homes existing
+                # docs, but a NEW insert that still references the vanished id
+                # trips the FK. Surface it as a 409 (retryable) instead of an
+                # unhandled 500.
+                raise ConflictError(
+                    f"Target collection or vault was concurrently deleted while creating: {path}"
+                ) from e
 
         # When `conn` is supplied, run on the caller's connection/TX so a
         # put can hold ONE pool connection for its whole critical section
@@ -253,6 +266,8 @@ class DocumentRepository:
         vault_id: uuid.UUID,
         max_depth: int,
         prefix: str = "",
+        *,
+        include_archived: bool = False,
     ) -> list[dict]:
         """List documents under ``prefix`` (vault root if ``prefix=""``)
         whose containing-collection depth, measured from inside the
@@ -276,6 +291,10 @@ class DocumentRepository:
             "current_commit, content_hash, hash_algorithm, content_hash_commit "
             "FROM documents WHERE vault_id = $1"
         )
+        # Default-hide archived docs from browse; opt back in with
+        # include_archived=true. Literal status — no bind param.
+        if not include_archived:
+            base_select += " AND status != 'archived'"
         params: list = [vault_id]
 
         if prefix:
@@ -586,11 +605,10 @@ class CollectionRepository:
     # ``_like_escape`` used to live here. The same triple-replace also
     # got copy-pasted into the inline prefix-filter inside
     # ``list_docs_by_depth`` (and into two other repos). Consolidated
-    # at ``app.util.text.like_escape`` — call sites now go through
-    # that, and this alias keeps the existing ``self._like_escape``
-    # call-pattern working without churn.
-    from app.util.text import like_escape as _like_escape_impl
-    _like_escape = staticmethod(_like_escape_impl)
+    # at ``app.util.text.like_escape`` (imported at module top) — call
+    # sites now go through that, and this alias keeps the existing
+    # ``self._like_escape`` call-pattern working without churn.
+    _like_escape = staticmethod(like_escape)
 
     async def list_docs_under(
         self,

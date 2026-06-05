@@ -18,7 +18,6 @@ import logging
 import re
 import uuid
 from datetime import datetime, timezone
-from difflib import get_close_matches
 
 import asyncpg
 
@@ -33,6 +32,17 @@ from app.services.index_service import (
 from app.services.role_sync import get_role_sync
 from app.services.uri_service import table_uri
 from app.services.user_sql_executor import PermissionDeniedError, get_user_sql_executor
+from app.util.errors import (
+    err,
+    METHOD_NOT_ALLOWED,
+    MULTI_STATEMENT,
+    PERMISSION_DENIED,
+    SQL_ERROR,
+    UNDEFINED_COLUMN,
+    UNDEFINED_TABLE,
+    VAULT_ARCHIVED,
+)
+from app.util.text import fuzzy_hint
 
 # Re-exported helpers used by publication_service for the
 # `table_query` share path. Other modules import directly from
@@ -242,6 +252,10 @@ async def list_tables(vault_id: uuid.UUID) -> list[dict]:
                 "vault": vault["name"],
                 "collection": r["collection"],
                 "name": r["name"],
+                # SQL-side identifier the caller must pass to akb_sql —
+                # mirrors `BrowseItem.sql_name` so REST clients have the
+                # same contract MCP clients got in 0.5.5 (issue #110).
+                "sql_name": table_data_repo.pg_short_name(r["name"]),
                 "description": r["description"],
                 "columns": table_registry_repo.parse_columns(r["columns"]),
                 "row_count": count,
@@ -449,8 +463,6 @@ async def alter_table(
     }
 
 
-import re as _re
-
 # Statement keywords allowed via `akb_sql`. Kept as a friendly
 # pre-flight check: PG would also reject non-DML at the role level
 # (akb_user_* roles have no CREATE/ALTER/DROP/GRANT privilege), but
@@ -490,17 +502,19 @@ async def execute_sql(
 
         sql_check = rewritten.rstrip(";").strip()
         if ";" in sql_check:
-            return {"error": "Multi-statement SQL is not allowed. Send one statement at a time."}
+            return err(
+                "Multi-statement SQL is not allowed. Send one statement at a time.",
+                code=MULTI_STATEMENT,
+            )
 
         upper = rewritten.strip().upper()
         if not upper.startswith(_ALLOWED_FIRST_KEYWORDS):
-            return {
-                "error": (
-                    "Only SELECT / WITH / INSERT / UPDATE / DELETE are allowed via "
-                    "akb_sql. Use akb_create_table / akb_alter_table / "
-                    "akb_drop_table for schema changes."
-                )
-            }
+            return err(
+                "Only SELECT / WITH / INSERT / UPDATE / DELETE are allowed via "
+                "akb_sql. Use akb_create_table / akb_alter_table / "
+                "akb_drop_table for schema changes.",
+                code=METHOD_NOT_ALLOWED,
+            )
 
         # Archived vaults are READ-ONLY. PG ACL has no archive concept
         # (write grants are intentionally preserved so unarchive is
@@ -515,13 +529,11 @@ async def execute_sql(
             )
             if archived:
                 names = ", ".join(sorted(r["name"] for r in archived))
-                return {
-                    "error": (
-                        f"Vault '{names}' is archived (read-only); writes via "
-                        f"akb_sql are not allowed. Unarchive the vault first."
-                    ),
-                    "code": "vault_archived",
-                }
+                return err(
+                    f"Vault '{names}' is archived (read-only); writes via "
+                    f"akb_sql are not allowed. Unarchive the vault first.",
+                    code=VAULT_ARCHIVED,
+                )
 
     try:
         return await get_user_sql_executor().execute(
@@ -533,12 +545,13 @@ async def execute_sql(
     except PermissionDeniedError as e:
         # PG ACL denied — the boundary working as designed. Surface
         # the PG error verbatim so callers know it came from PG, not
-        # from application validation.
-        return {
-            "error": str(e),
-            "code": "permission_denied",
-            "pg_sqlstate": e.pg_sqlstate,
-        }
+        # from application validation. `pg_sqlstate` lives under
+        # `details` per the canonical shape.
+        return err(
+            str(e),
+            code=PERMISSION_DENIED,
+            pg_sqlstate=e.pg_sqlstate,
+        )
     except Exception as e:  # noqa: BLE001 — fall through to enrichment
         msg = str(e)
         # Try to enrich column/table-not-exist errors with fuzzy-match
@@ -552,14 +565,11 @@ async def execute_sql(
             )
         if enriched:
             return enriched
-        return {"error": msg}
+        return err(msg, code=SQL_ERROR)
 
 
-# Max items listed in fallback hints (when no fuzzy suggestion strong enough).
-_HINT_LIST_LIMIT = 15
-
-_COLUMN_NOT_EXIST = _re.compile(r'column "([^"]+)" does not exist')
-_RELATION_NOT_EXIST = _re.compile(r'relation "([^"]+)" does not exist')
+_COLUMN_NOT_EXIST = re.compile(r'column "([^"]+)" does not exist')
+_RELATION_NOT_EXIST = re.compile(r'relation "([^"]+)" does not exist')
 
 
 async def _enrich_undefined_error(
@@ -575,8 +585,12 @@ async def _enrich_undefined_error(
     rewritten table list (e.g. ``{"vt_sales__pipeline"}``) — we never
     suggest names from other vaults.
 
-    Returns None when the error isn't a recoverable shape, letting the
-    caller fall through to the verbatim PG message.
+    Returns the canonical 0.5.6 error envelope (``err(...)`` with
+    ``code=undefined_column`` or ``undefined_table``, ``hint``, and
+    ``details.available_columns`` / ``details.available_tables``), or
+    ``None`` when the PG message isn't a recoverable shape — in which
+    case the caller falls through to the verbatim PG message wrapped
+    in ``err(msg, code=SQL_ERROR)``.
     """
     if not allowed_pg_tables:
         return None
@@ -587,18 +601,19 @@ async def _enrich_undefined_error(
         col_meta = await _fetch_column_meta(conn, allowed_pg_tables)
         if not col_meta:
             return None
-        hint = _fuzzy_hint(bad_col, list(col_meta.keys()), label="columns")
+        hint = fuzzy_hint(bad_col, list(col_meta.keys()), label="columns")
         jsonb_cols = [c for c, t in col_meta.items() if t == "jsonb"]
         if jsonb_cols:
             hint += (
                 f"  (jsonb columns — use `<col>::text ILIKE '%X%'`: "
                 f"{', '.join(jsonb_cols)})"
             )
-        return {
-            "error": err_msg,
-            "hint": hint,
-            "available_columns": list(col_meta.keys()),
-        }
+        return err(
+            err_msg,
+            code=UNDEFINED_COLUMN,
+            hint=hint,
+            available_columns=list(col_meta.keys()),
+        )
 
     # ── Relation/table not exist ────────────────────────────────
     if m := _RELATION_NOT_EXIST.search(err_msg):
@@ -610,16 +625,17 @@ async def _enrich_undefined_error(
         })
         if not short_names:
             return None
-        hint = _fuzzy_hint(bad_rel, short_names, label="tables")
+        hint = fuzzy_hint(bad_rel, short_names, label="tables")
         hint += (
             "  (Reference vault tables by their short name — the rewriter "
             "prefixes them with `vt_<vault>__` automatically.)"
         )
-        return {
-            "error": err_msg,
-            "hint": hint,
-            "available_tables": short_names,
-        }
+        return err(
+            err_msg,
+            code=UNDEFINED_TABLE,
+            hint=hint,
+            available_tables=short_names,
+        )
 
     return None
 
@@ -647,13 +663,3 @@ async def _fetch_column_meta(conn, table_names: set[str]) -> dict[str, str]:
         list(table_names),
     )
     return {r["name"]: r["type"] for r in rows}
-
-
-def _fuzzy_hint(bad: str, candidates: list[str], *, label: str) -> str:
-    """Top-3 close matches → 'Did you mean…?', else first N as fallback."""
-    suggestions = get_close_matches(bad, candidates, n=3, cutoff=0.6)
-    if suggestions:
-        return f"Did you mean: {', '.join(suggestions)}?"
-    truncated = candidates[:_HINT_LIST_LIMIT]
-    suffix = " …" if len(candidates) > _HINT_LIST_LIMIT else ""
-    return f"Available {label}: {', '.join(truncated)}{suffix}"

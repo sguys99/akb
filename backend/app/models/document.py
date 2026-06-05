@@ -6,6 +6,17 @@ from pydantic import BaseModel, Field
 
 from app.util.text import NFCModel
 
+# Allowed document lifecycle statuses. A soft signal:
+#   draft  — default on create; work-in-progress, promote when ready
+#   active — promoted / live
+#   archived — retired; excluded from default search + browse (opt back in
+#              with include_archived=true)
+# Status does not gate access (read/write permissions are independent), but
+# archived now influences default discovery, and the set is constrained so a
+# typo can't silently land in the frontmatter and DB. ("superseded" was a
+# never-operationalized 4th state and was removed in 0.4.4.)
+DOC_STATUSES = ("draft", "active", "archived")
+
 
 class DocumentFrontmatter(NFCModel):
     """Canonical frontmatter schema parsed from YAML."""
@@ -13,11 +24,10 @@ class DocumentFrontmatter(NFCModel):
     id: str | None = None
     title: str
     type: str = "note"  # note, report, decision, spec, plan, session, task, reference, skill
-    status: str = "draft"  # draft, active, archived, superseded
+    status: str = "draft"  # draft, active, archived
     created_by: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
-    supersedes: str | None = None
     tags: list[str] = Field(default_factory=list)
     domain: str | None = None
     summary: str | None = None
@@ -34,6 +44,11 @@ class DocumentPutRequest(NFCModel):
     title: str
     content: str
     type: str = "note"
+    # Lifecycle status stamped into the frontmatter + DB row on create.
+    # Defaults to "draft" (the historical behaviour); pass e.g. "active" to
+    # publish on create instead of having to follow up with akb_update.
+    # Validated against DOC_STATUSES in DocumentService.put.
+    status: str = "draft"
     tags: list[str] = Field(default_factory=list)
     domain: str | None = None
     summary: str | None = None
@@ -158,6 +173,12 @@ class BrowseItem(BaseModel):
     # Table fields
     row_count: int | None = None
     columns: list[dict] | None = None
+    # SQL identifier the caller should pass to `akb_sql` — the right
+    # half of `vt_<vault>__<table>`. The display ``name`` can contain
+    # hyphens or non-ASCII characters that the sanitiser collapses to
+    # underscores; ``sql_name`` is what survives that transform and is
+    # what the rewriter keys off. Issue #110.
+    sql_name: str | None = None
     # File fields
     mime_type: str | None = None
     size_bytes: int | None = None

@@ -231,12 +231,12 @@ EDIT_DOC_URI=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdi
 
 # 3a. Edit: old_string not found → error
 R=$(mcp_as "$PAT1" "$SID1" "akb_edit" "{\"uri\":\"$EDIT_DOC_URI\",\"old_string\":\"NOTHING LIKE THIS EXISTS\",\"new_string\":\"whatever\"}" | mr)
-NOT_FOUND_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('error','')=='edit_failed' and 'not found' in d.get('message','').lower())" 2>/dev/null)
+NOT_FOUND_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('code','')=='edit_failed' and 'not found' in d.get('error','').lower())" 2>/dev/null)
 [ "$NOT_FOUND_ERR" = "True" ] && pass "Edit: old_string not found rejected" || fail "Edit not found" "$R"
 
 # 3b. Edit: old_string not unique → error
 R=$(mcp_as "$PAT1" "$SID1" "akb_edit" "{\"uri\":\"$EDIT_DOC_URI\",\"old_string\":\"Beta repeated\",\"new_string\":\"Beta replaced\"}" | mr)
-NOT_UNIQUE_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('error','')=='edit_failed' and 'appears' in d.get('message',''))" 2>/dev/null)
+NOT_UNIQUE_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('code','')=='edit_failed' and 'appears' in d.get('error',''))" 2>/dev/null)
 [ "$NOT_UNIQUE_ERR" = "True" ] && pass "Edit: non-unique old_string rejected" || fail "Edit non-unique" "$R"
 
 # 3c. Edit: valid single replacement
@@ -251,46 +251,14 @@ EDIT_ALL_COMMIT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.s
 
 # 3e. Edit: empty old_string rejected
 R=$(mcp_as "$PAT1" "$SID1" "akb_edit" "{\"uri\":\"$EDIT_DOC_URI\",\"old_string\":\"\",\"new_string\":\"x\"}" | mr)
-EMPTY_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('error','')=='edit_failed' and 'empty' in d.get('message','').lower())" 2>/dev/null)
+EMPTY_ERR=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('code','')=='edit_failed' and 'empty' in d.get('error','').lower())" 2>/dev/null)
 [ "$EMPTY_ERR" = "True" ] && pass "Edit: empty old_string rejected" || fail "Empty old_string" "$R"
 
-# ── 4. Memory Category Filtering ─────────────────────────────
-echo ""
-echo "▸ 4. Memory Category Filtering"
-
-# Create memories in different categories
-R=$(mcp_as "$PAT1" "$SID1" "akb_remember" '{"content":"I prefer dark mode","category":"preference"}' | mr)
-MEM_PREF=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['memory_id'])" 2>/dev/null)
-
-R=$(mcp_as "$PAT1" "$SID1" "akb_remember" '{"content":"Learned about vector indexing","category":"learning"}' | mr)
-MEM_LEARN=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['memory_id'])" 2>/dev/null)
-
-R=$(mcp_as "$PAT1" "$SID1" "akb_remember" '{"content":"Working on RFP analysis","category":"context"}' | mr)
-MEM_CTX=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['memory_id'])" 2>/dev/null)
-
-[ -n "$MEM_PREF" ] && [ -n "$MEM_LEARN" ] && [ -n "$MEM_CTX" ] && pass "3 memories created in different categories" || fail "Memory create" "missing IDs"
-
-# Filter by category
-R=$(mcp_as "$PAT1" "$SID1" "akb_recall" '{"category":"preference"}' | mr)
-PREF_COUNT=$(echo "$R" | python3 -c "import sys,json; mems=json.load(sys.stdin)['memories']; print(len([m for m in mems if m['category']=='preference']))" 2>/dev/null)
-PREF_TOTAL=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['memories']))" 2>/dev/null)
-[ "$PREF_COUNT" = "$PREF_TOTAL" ] && pass "Category filter: only preference returned ($PREF_COUNT)" || fail "Category filter" "expected all preference, got $PREF_COUNT of $PREF_TOTAL"
-
-# Recall all
-R=$(mcp_as "$PAT1" "$SID1" "akb_recall" '{}' | mr)
-ALL_COUNT=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['memories']))" 2>/dev/null)
-[ "$ALL_COUNT" -ge 3 ] 2>/dev/null && pass "Recall all: $ALL_COUNT memories" || fail "Recall all" "expected >=3, got $ALL_COUNT"
-
-# User2 should NOT see user1's memories
-R=$(mcp_as "$PAT2" "$SID2" "akb_recall" '{}' | mr)
-U2_MEMS=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['memories']))" 2>/dev/null)
-[ "$U2_MEMS" = "0" ] && pass "User2 sees 0 of User1's memories (isolation)" || fail "Memory isolation" "User2 sees $U2_MEMS memories"
-
-# Cleanup memories
-mcp_as "$PAT1" "$SID1" "akb_forget" "{\"memory_id\":\"$MEM_PREF\"}" >/dev/null 2>&1
-mcp_as "$PAT1" "$SID1" "akb_forget" "{\"memory_id\":\"$MEM_LEARN\"}" >/dev/null 2>&1
-mcp_as "$PAT1" "$SID1" "akb_forget" "{\"memory_id\":\"$MEM_CTX\"}" >/dev/null 2>&1
-pass "Memories cleaned up"
+# Section 4 (Memory Category Filtering) and 5 (memory cross-user
+# isolation) were retired in v0.5.0 alongside the akb_remember/recall/
+# forget MCP tool removal. Per-user vault isolation is exercised by
+# Section 1 (documents) and Section 2 (search) above using the same
+# access_service.check_vault_access gate that the memory routes used.
 
 # ── 6. Drill-down with d- prefix ID ─────────────────────────
 echo ""
@@ -471,6 +439,24 @@ RS=$(echo "$INFO" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.g
 # Cleanup: delete the throwaway public vault before the suite's general cleanup runs.
 curl -sk -X DELETE "$BASE_URL/api/v1/vaults/$PUBLIC_VAULT" \
   -H "Authorization: Bearer $PAT1" >/dev/null
+
+# ── 10. Unknown-arg validation (fuzzy hint) ──────────────────
+echo ""
+echo "▸ 10. Unknown-arg validation (fuzzy hint)"
+
+# Typo `user=` instead of `author=` on akb_activity must be rejected
+# with a fuzzy hint, not silently ignored — silent ignore was the
+# regression that motivated this dispatch-level gate.
+R=$(mcp_as "$PAT1" "$SID1" "akb_activity" "{\"vault\":\"$VAULT1\",\"user\":\"nobody\"}" | mr)
+ERR=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error','MISSING'))" 2>/dev/null)
+HINT=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('hint',''))" 2>/dev/null)
+echo "$ERR" | grep -q "Unknown argument 'user'" && pass "unknown arg surfaced" || fail "unknown arg" "got: $ERR"
+echo "$HINT" | grep -q "author" && pass "fuzzy hint suggests 'author'" || fail "fuzzy hint" "got: $HINT"
+
+# Regression guard: valid call still works through the new gate
+R=$(mcp_as "$PAT1" "$SID1" "akb_activity" "{\"vault\":\"$VAULT1\",\"author\":\"nobody\"}" | mr)
+RET=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('returned','MISSING'))" 2>/dev/null)
+[ "$RET" != "MISSING" ] && pass "valid call passes through" || fail "valid call" "got: $R"
 
 # ── Cleanup ──────────────────────────────────────────────────
 echo ""

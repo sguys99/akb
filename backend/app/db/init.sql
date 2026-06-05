@@ -101,7 +101,7 @@ CREATE TABLE IF NOT EXISTS documents (
     path TEXT NOT NULL,                -- relative path within vault (e.g. "api-specs/payment-v2.md")
     title TEXT NOT NULL,
     doc_type TEXT,                     -- note, report, decision, spec, plan, session, task, reference
-    status TEXT NOT NULL DEFAULT 'draft',  -- draft, active, archived, superseded
+    status TEXT NOT NULL DEFAULT 'draft',  -- draft, active, archived
     summary TEXT,                      -- L2 summary (auto-generated or author-provided)
     domain TEXT,                       -- engineering, product, ops, legal, ...
     created_by TEXT,                   -- principal who created
@@ -113,7 +113,6 @@ CREATE TABLE IF NOT EXISTS documents (
     content_hash_commit TEXT,          -- commit the content_hash projection was computed from
     tags TEXT[] DEFAULT '{}',
     metadata JSONB DEFAULT '{}',       -- extended metadata from frontmatter
-    supersedes UUID REFERENCES documents(id) ON DELETE SET NULL,
     UNIQUE(vault_id, path)
 );
 
@@ -336,36 +335,8 @@ CREATE TABLE IF NOT EXISTS todos (
 CREATE INDEX IF NOT EXISTS idx_todos_assignee ON todos(assignee_id, status);
 CREATE INDEX IF NOT EXISTS idx_todos_created_by ON todos(created_by);
 
--- ============================================================
--- Agent Memories (per-user persistent memory)
--- ============================================================
-CREATE TABLE IF NOT EXISTS memories (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    category TEXT NOT NULL DEFAULT 'general',  -- context, preference, learning, work, general
-    content TEXT NOT NULL,
-    source TEXT DEFAULT 'manual',              -- manual, session_auto
-    session_id UUID,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_memories_user ON memories(user_id);
-CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(user_id, category);
-
--- ============================================================
--- Sessions (agent work sessions)
--- ============================================================
-CREATE TABLE IF NOT EXISTS sessions (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    vault_id UUID NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
-    agent_id TEXT NOT NULL,
-    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    ended_at TIMESTAMPTZ,
-    context TEXT,
-    summary TEXT,
-    doc_ids UUID[] DEFAULT '{}'
-);
-
-CREATE INDEX IF NOT EXISTS idx_sessions_vault ON sessions(vault_id);
-CREATE INDEX IF NOT EXISTS idx_sessions_agent ON sessions(agent_id);
+-- Agent memories + sessions tables removed in v0.4.0 alongside the
+-- akb_remember/recall/forget MCP tool family. Agent dedicated memory
+-- is now expressed as a vault (agent-memory-{username}) with per-session
+-- collections, driven by the /api/v1/agent-sessions REST endpoints.
+-- Existing rows are dropped by migration 031.

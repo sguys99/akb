@@ -108,6 +108,7 @@ import frontmatter
 from app.db.postgres import get_pool
 from app.exceptions import AKBError, ConflictError, NotFoundError, ValidationError
 from app.models.document import (
+    DOC_STATUSES,
     BrowseItem,
     BrowseResponse,
     DocumentPutRequest,
@@ -165,7 +166,7 @@ def _build_frontmatter(req: DocumentPutRequest, now: datetime) -> dict:
     fm = {
         "title": req.title,
         "type": req.type,
-        "status": "draft",
+        "status": req.status,
         "created_at": now.isoformat(),
         "updated_at": now.isoformat(),
         "tags": req.tags,
@@ -266,6 +267,10 @@ class DocumentService:
     # ── Put ───────────────────────────────────────────────────
 
     async def put(self, req: DocumentPutRequest, agent_id: str | None = None) -> DocumentPutResponse:
+        if req.status not in DOC_STATUSES:
+            raise ValidationError(
+                f"status must be one of {list(DOC_STATUSES)}, got {req.status!r}"
+            )
         vault_repo, doc_repo, coll_repo = await self._repos()
 
         vault_id = await vault_repo.get_id_by_name(req.vault)
@@ -337,7 +342,7 @@ class DocumentService:
         # — user document writes never populate it.
         pg_doc_id = await doc_repo.create(
             vault_id=vault_id, collection_id=collection_id, path=file_path,
-            title=req.title, doc_type=req.type, status="draft",
+            title=req.title, doc_type=req.type, status=req.status,
             summary=fm_dict.get("summary") or req.summary, domain=req.domain, created_by=agent_id,
             now=now, commit_hash=commit_hash, content_hash=content_hash,
             hash_algorithm=HASH_ALGORITHM, tags=req.tags, metadata={}, conn=conn,
@@ -514,6 +519,10 @@ class DocumentService:
     # ── Update ────────────────────────────────────────────────
 
     async def update(self, vault: str, doc_ref: str, req: DocumentUpdateRequest, agent_id: str | None = None) -> DocumentPutResponse:
+        if req.status is not None and req.status not in DOC_STATUSES:
+            raise ValidationError(
+                f"status must be one of {list(DOC_STATUSES)}, got {req.status!r}"
+            )
         vault_repo, doc_repo, _ = await self._repos()
 
         vault_id = await vault_repo.get_id_by_name(vault)
@@ -927,6 +936,7 @@ class DocumentService:
         depth: int = 1,
         content_type: str = "all",
         include_hashes: bool = False,
+        include_archived: bool = False,
     ) -> BrowseResponse:
         """Unified vault browse.
 
@@ -975,7 +985,7 @@ class DocumentService:
             items.extend(await self._browse_collections(coll_repo, vault, vault_id, prefix))
             items.extend(await self._browse_docs(
                 doc_repo, vault, vault_id, prefix=prefix, max_depth=depth,
-                include_hashes=include_hashes,
+                include_hashes=include_hashes, include_archived=include_archived,
             ))
         if show_tables:
             items.extend(await self._browse_tables_by_depth(
@@ -1025,10 +1035,13 @@ class DocumentService:
         prefix: str,
         max_depth: int,
         include_hashes: bool = False,
+        include_archived: bool = False,
     ) -> list[BrowseItem]:
         """Documents under ``prefix`` whose depth (from inside the
         prefix) is ≤ ``max_depth``. ``max_depth < 0`` is unbounded."""
-        rows = await doc_repo.list_docs_by_depth(vault_id, max_depth, prefix)
+        rows = await doc_repo.list_docs_by_depth(
+            vault_id, max_depth, prefix, include_archived=include_archived,
+        )
         items: list[BrowseItem] = []
         for r in rows:
             content_hash = r.get("content_hash")
@@ -1098,6 +1111,7 @@ class DocumentService:
                     uri=table_uri(vault, r["name"], collection=r.get("collection")),
                     summary=r["description"], row_count=row_count,
                     columns=cols,
+                    sql_name=table_data_repo.pg_short_name(r["name"]),
                     collection=r.get("collection"),
                     last_updated=r["created_at"],
                 ))

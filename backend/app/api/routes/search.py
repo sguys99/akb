@@ -21,12 +21,13 @@ async def search_documents(
     type: str | None = Query(None),
     tags: list[str] | None = Query(None),
     limit: int = Query(10, ge=1, le=100),
+    include_archived: bool = Query(False, description="Include archived documents (hidden from search by default)."),
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     return await search_service.search(
         query=q, vault=vault, collection=collection,
         doc_type=type, tags=tags, limit=limit,
-        user_id=user.user_id,
+        user_id=user.user_id, include_archived=include_archived,
     )
 
 
@@ -37,7 +38,7 @@ async def drill_down(
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     parsed = parse_uri(uri)
-    if parsed is None or parsed.kind != "doc":
+    if parsed is None or parsed.kind != "doc" or parsed.identifier is None:
         raise HTTPException(status_code=400, detail=f"Expected a doc URI, got {uri!r}")
     vault, doc_path = parsed.vault, parsed.identifier
     # MCP `akb_drill_down` enforces vault ACL via check_vault_access; the

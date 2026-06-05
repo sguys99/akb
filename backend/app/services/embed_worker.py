@@ -32,6 +32,7 @@ from app.services import sparse_encoder
 from app.services._backfill import BackfillRunner, MAX_RETRIES, next_attempt_delay
 from app.services.index_service import generate_embeddings
 from app.services.vector_store import VectorStoreUnavailable, get_vector_store
+from app.services.vector_store.base import has_dense
 
 logger = logging.getLogger("akb.embed_worker")
 
@@ -127,36 +128,59 @@ async def _process_once() -> int:
         return 0
 
     # Stage 2: embedding API. Outside any PG transaction — the conn
-    # pool stays free during the network round-trip.
+    # pool stays free during the network round-trip. Three failure
+    # modes are merged here into the same outcome (sparse-only batch);
+    # only the log differs:
+    #
+    #   (a) `embed_base_url` unset       — embed intentionally disabled.
+    #   (b) configured + transient outage — `generate_embeddings` raised.
+    #   (c) configured + partial response — len mismatch; treated as
+    #       outage rather than guessing which rows were rejected.
+    #
+    # In all three the per-row loop below sees `None` for that row
+    # and sparse-only indexes. Per-row rejects (single-row `[]` from
+    # the API while the rest succeeded) can't be distinguished from
+    # outages without a richer upstream contract; if that becomes a
+    # signal we care about, surface it from `generate_embeddings`.
     texts = [r["content"] or "" for r in batch]
-    try:
-        embeddings = await generate_embeddings(texts)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("Embedding call crashed: %s", e)
-        embeddings = []
-
-    if not embeddings or len(embeddings) != len(batch):
-        # Batch-wide failure (API down, malformed response).
-        for row in batch:
-            await _mark_failure(
-                pool, row["id"], row["vector_retry_count"],
-                "embedding API returned no/partial result",
+    embed_enabled = bool(settings.embed_base_url)
+    embeddings: list[list[float]] = []
+    if not embed_enabled:
+        logger.debug(
+            "embedding disabled (embed_base_url unset); "
+            "indexing batch=%d as sparse-only",
+            len(batch),
+        )
+    else:
+        try:
+            embeddings = await generate_embeddings(texts)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "embedding API call failed (sparse-only fallback for this batch): %s", e,
             )
-        return 0
+            embeddings = []
+
+    # `generate_embeddings` returns either [] (batch-wide failure / not
+    # called) or exactly one list-per-row. Catch any other length here
+    # loudly rather than silently mismatching with `zip`.
+    if embeddings and len(embeddings) != len(batch):
+        logger.error(
+            "embedding API returned %d results for batch=%d; treating as outage",
+            len(embeddings), len(batch),
+        )
+        embeddings = []
+    # Pad to batch length so the per-row loop always zips. A `None`
+    # entry means "no dense vector for this row".
+    embeddings_padded: list[list[float] | None] = list(embeddings) + [None] * (
+        len(batch) - len(embeddings)
+    )
 
     # Stage 3: per-chunk transaction. Each iteration is atomic over
     # vector_store.upsert + chunks.UPDATE — outer rollback can no
     # longer leave the vector store with an unmarked row.
     store = get_vector_store()
     succeeded = 0
-    for row, dense in zip(batch, embeddings):
-        if not dense:
-            await _mark_failure(
-                pool, row["id"], row["vector_retry_count"],
-                "empty embedding vector",
-            )
-            continue
-
+    for row, dense in zip(batch, embeddings_padded):
         content = row["content"] or ""
         try:
             sparse_idx, sparse_vals = await sparse_encoder.encode_document(content)
@@ -164,6 +188,20 @@ async def _process_once() -> int:
             await _mark_failure(
                 pool, row["id"], row["vector_retry_count"],
                 f"sparse encode failed: {e}",
+            )
+            continue
+
+        # Refuse useless points up-front: a chunk with neither dense nor
+        # sparse signal would write a NULL+empty pgvector row or a
+        # vectors={} Qdrant point (the latter is rejected by the driver
+        # with a less specific error). Cause is whitespace-only or
+        # OOV-only content during an embed-disabled / outage state; the
+        # operator should see it as a real failure, not a sparse-only
+        # success.
+        if not has_dense(dense) and not sparse_idx:
+            await _mark_failure(
+                pool, row["id"], row["vector_retry_count"],
+                "no indexable signal (no dense embedding + empty sparse)",
             )
             continue
 

@@ -5,6 +5,1469 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.7.2 — 2026-06-05  *(patch — `seahorse-db` driver wire format actually verified end-to-end; retracts 0.7.0/0.7.1 false-positive claims)*
+
+### Retraction of 0.7.0 + 0.7.1 status claims
+
+0.7.0 shipped the `seahorse-db` driver with wire formats reverse-
+engineered from `routes.rs` path strings alone. 0.7.1 added an opt-in
+smoke E2E that claimed 6/6 PASS. Both releases overstated what was
+verified. Running the driver against a live Coral coordinator in
+this release uncovered that:
+
+- The route prefix is `/v2/tables/...`, NOT `/v2/catalog/tables/...`
+  (we had `catalog/` in there) and NOT `/catalog/tables/...` (0.7.0
+  shape). Wrong prefixes fell through to the same-port gRPC
+  fallback and returned `HTTP/1.1 200 OK` + `content-type:
+  application/grpc` + `grpc-status: 12`. The 0.7.1 smoke checked
+  status code only and counted every call as a pass.
+- `POST /v2/tables` expects flat `table_name` + top-level `columns`
+  (SCREAMING_SNAKE types: `INT64`, `STRING`, `{name: DENSE_VECTOR,
+  element: FLOAT32, dim}`, `{name: SPARSE_VECTOR}`) + `segmentation`
+  (`{strategy: hash, columns: [id], buckets: 1, composition:
+  single}`) + `indexes` (lowercase `hnsw` / `inverted`). 0.7.0
+  emitted nested `schema.columns` with `column_type` keys, no
+  segmentation, PascalCase index types, and `distance_space: Cosine`
+  — every field name and shape was off.
+- HNSW only accepts `space: "ip" | "l2"`. `cosine` is rejected at
+  segment build time (`Hnsw index does not support cosinespace`).
+  AKB callers using cosine-equivalent retrieval must normalise to
+  unit norm and use `ip`. The `seahorsedb_distance` Literal is now
+  `"l2" | "ip"`.
+- `POST /v2/tables/{name}/data` requires
+  `Content-Type: application/x-ndjson` (JSONL). `application/json`
+  fails with HTTP 400 `400102 Unsupported Content-Type for /data
+  insert`. 0.7.0 sent `application/json` + a `{"records": [...]}`
+  wrapper, both wrong.
+- Sparse vectors are a **single string** per row
+  (`"term_id:weight term_id:weight"`, space-separated), not a list
+  of pairs.
+- `POST /v2/tables/{name}/data/delete` payload is
+  `{"delete_condition": "<SQL WHERE clause>"}`, not
+  `{"labels": [u64, ...]}`.
+- `POST /v2/tables/{name}/data/hybrid-search` payload uses separate
+  `dense` and `sparse` config objects (each with `column`,
+  `vectors`, optional `parameters`), a `fusion` block, an SQL
+  `projection` string, and an SQL `filter` string. Response is
+  enveloped: `body["data"]["data"][0]` is the hit list (one
+  resultset per query vector).
+
+### End-to-end verification in this release
+
+- Backend started with `vector_store_driver: seahorse-db` pointed
+  at a live Coral. Lifespan `ensure_collection` made the table:
+  `GET /v2/tables/akb_validation → 404` then
+  `POST /v2/tables → 200 application/json`.
+- Document put via AKB REST API → `embed_worker` claimed the
+  chunks → driver POSTed each row as JSONL to
+  `/v2/tables/akb_validation/data` → Coral returned `200 OK` with
+  `inserted_row_count: 1` per chunk.
+- AKB search REST endpoint with `vault=sdb-test&q=Korean tokenization`
+  → driver POSTed hybrid-search → Coral returned 2 hits with the
+  expected `content`/`source_id`/`chunk_id`/`score` fields →
+  AKB rendered the hits at `/api/v1/search`. **Every response
+  checked for `content-type: application/json` to rule out gRPC
+  fallback.**
+
+### Driver gaps still present (honestly)
+
+- **Dense-less (BM25-only) upsert + search not supported.** The
+  embedding column is currently `nullable: false`; ingest raises
+  `VectorStoreUnavailable` when `dense=None`. To match pgvector's
+  BM25 fallback we'd need a NULL embedding column AND a
+  sparse-only search path on Coral (single-leg vector search
+  endpoint exists; not wired through this driver yet).
+- **BM25 per-query metadata not sent.** Hybrid search omits
+  `parameters` and `metadata` on the sparse leg; Coral falls back
+  to defaults. AKB has `bm25_stats` (N, avgdl, df), so the
+  retrieval quality could improve by shipping them per query.
+- **Race-safety still ⚠.** No PG-advisory-lock-grade primitive
+  on Coral; concurrent `ensure_collection` peers rely on Coral's
+  server-side serialisation.
+- **No `test_hybrid_search_e2e.sh` against seahorse-db yet.** AKB's
+  25-scenario hybrid suite still runs only against pgvector. The
+  driver-level smoke (`test_seahorse_db_e2e.sh`) needs its own
+  rewrite to match the corrected wire formats — that's the next
+  PR. Until then, "driver works on a single happy-path doc" is
+  what we claim, not "production ready".
+- **Kafka eventual consistency UX.** Coral's `POST /data` returns
+  on Kafka-accept, not on visibility (~10-30s lag). `embed_worker`
+  marks `vector_indexed_at` on insert-accept, so a doc you just
+  put may not appear in search for that window. Same shape any
+  async-indexing driver has, but worth knowing.
+
+### Files changed
+
+- `backend/app/services/vector_store/seahorse_db.py` — every wire
+  format and the helpers (`_encode_sparse_string`,
+  `_validate_uuid_for_sql`, `_is_grpc_fallback`). The
+  `_is_grpc_fallback` content-type check is the safety net that
+  prevented this miss from happening again.
+- `backend/app/config.py` — `seahorsedb_distance` Literal
+  `"cosine" | "l2" | "ip"` → `"l2" | "ip"` (cosine was never
+  valid).
+
+### What this PR does NOT do
+
+- Does NOT publish a corrected `test_seahorse_db_e2e.sh` (that
+  ships in the next PR with content-type assertions baked in).
+- Does NOT change prod / demo — both still pgvector.
+- Does NOT cover the BM25-only / sparse-only path.
+
+---
+
+## 0.7.1 — 2026-06-05  *(patch — `seahorse-db` driver wire-shape smoke E2E + `.gitignore` overlay slot)*
+
+⚠ **RETRACTED by 0.7.2**: the "6/6 PASS" claim in this release is
+a false positive. Every request fell through Coral's gRPC fallback
+on the unmatched HTTP REST path, so the smoke validated nothing.
+See 0.7.2's retraction section.
+
+### `backend/tests/test_seahorse_db_e2e.sh`
+
+Opt-in smoke E2E that confirms the `seahorse-db` driver's emitted wire
+shapes (table create schema, dense+sparse insert payload, delete by
+label) are accepted by a live Coral coordinator. Skips cleanly when
+`SEAHORSEDB_CORAL_URL` is unset — CI passes without a Coral available;
+developers with a local SeahorseDB stack pass the URL.
+
+Covers:
+- Coral `/health` reachability
+- `POST /catalog/tables` with the exact schema `SeahorseDbStore._build_create_table_payload()` emits
+- `GET /catalog/tables/{name}` (mirrors `ensure_collection`'s existence check)
+- `POST /data` with one record carrying both `embedding` (dense) and `sparse` ([[term_id, weight], ...])
+- `POST /data/delete` by `u64` label (matches `_chunk_id_to_label` output)
+- Cleanup
+
+Does NOT cover (intentionally):
+- Hybrid-search retrieval. SeahorseDB ingest goes through Kafka before
+  the row is searchable; wait windows are ~10-30s and harder to budget
+  for a smoke. Retrieval flow lives in `test_hybrid_search_e2e.sh`
+  against pgvector; this script asserts only "the bytes reach Coral
+  in the shape the driver promised".
+- Cross-process race-safety (no Coral primitive equivalent to PG
+  advisory lock; ⚠ in `base.py` audit table).
+
+Verified locally against a Coral built from the SeahorseDB monorepo's
+`cloud-functional-test` scenario: **6/6 PASS**.
+
+### `.gitignore` — `docker-compose.override.yml` slot
+
+Added `docker-compose.override.yml` + `docker-compose.*.override.yml`
+to `.gitignore`. `docker compose` auto-merges any `*.override.yml` in
+CWD on top of the base — this lets developers wire AKB backend to a
+local SeahorseDB stack (or any other private-image stack) without that
+overlay leaking into the tracked compose, which has to stay OSS-friendly.
+SeahorseDB images are dn-inc commercial and aren't pullable by external
+users, so the overlay path is local-only by design.
+
+### Verification
+
+- `bash scripts/check.sh` — green.
+- `SEAHORSEDB_CORAL_URL=http://localhost:NNNN bash backend/tests/test_seahorse_db_e2e.sh` — 6/6 against live Coral.
+- Without env var — skips cleanly (exit 0).
+
+---
+
+## 0.7.0 — 2026-06-05  *(minor — split `seahorse` driver into `seahorse-cloud` + new self-hosted `seahorse-db`)*
+
+### What
+
+Two vector-store drivers under the Seahorse brand, separated:
+
+- **`seahorse-cloud`** (renamed from `seahorse`) — talks to the
+  managed Seahorse Cloud BFF + per-table data-plane host. Zero
+  infrastructure to run; you supply tenant + token + table.
+- **`seahorse-db`** (new) — talks to a self-hosted SeahorseDB cluster
+  via its Coral coordinator HTTP API. You run Coral + Writer +
+  Reader(s) + Redis + Kafka + sparse-embedding-server yourself
+  (SeahorseDB monorepo's `deploy/docker-compose.yml` brings up a
+  minimal stack on one box).
+
+The pre-0.7.0 single `seahorse` driver value implicitly meant
+cloud. Keeping the name ambiguous would have been a footgun the
+moment a self-hosted user filled in `seahorsedb_coordinator_url`
+expecting the same enum value to "just work".
+
+### Driver matrix now
+
+| `vector_store_driver` | required settings                                       |
+| --------------------- | ------------------------------------------------------- |
+| `qdrant`              | `vector_url` (+ optional `vector_api_key`)              |
+| `pgvector`            | `vector_store_dsn` blank reuses main PG                 |
+| `seahorse-cloud`      | `seahorse_cloud_token` + `seahorse_cloud_tenant_uuid` + |
+|                       | one of `..._table_name` / `..._table_uuid`              |
+| `seahorse-db`         | `seahorsedb_coordinator_url` (Coral HTTP API)           |
+
+### Config migration (BREAKING)
+
+If you were using the `seahorse` driver pre-0.7.0:
+
+```diff
+-vector_store_driver: seahorse
+-seahorse_management_url: "https://console.seahorse.dnotitia.ai/bff"
+-seahorse_token: "shsk_..."
+-seahorse_tenant_uuid: "..."
+-seahorse_table_name: "..."
+-seahorse_auto_create: true
++vector_store_driver: seahorse-cloud
++seahorse_cloud_management_url: "https://console.seahorse.dnotitia.ai/bff"
++seahorse_cloud_token: "shsk_..."
++seahorse_cloud_tenant_uuid: "..."
++seahorse_cloud_table_name: "..."
++seahorse_cloud_auto_create: true
+```
+
+`pydantic` config has `extra="forbid"`, so an un-migrated `seahorse_*`
+key fails the app launch loudly with the bad key name — no silent
+fallback. That's intentional; a half-migrated config silently
+sending writes to the wrong driver is the worst possible outcome.
+
+Default driver is unchanged (`qdrant`). prod + demo run `pgvector`,
+so neither is affected by this rename.
+
+### New driver implementation notes
+
+- Surface area: 5 methods (`ensure_collection`, `health`, `upsert_one`,
+  `delete_point`, `hybrid_search`) — same Protocol as the other drivers,
+  no service-layer changes needed.
+- Coral endpoint mapping is documented at the top of
+  `backend/app/services/vector_store/seahorse_db.py`.
+- Sparse encoding: AKB's parallel `sparse_indices` + `sparse_values`
+  arrays are zipped into Coral's `[[term_id, weight], ...]` shape at
+  the driver boundary. The rest of AKB stays Coral-shape-free.
+- Label mapping: SeahorseDB identifies records by `u64` labels; AKB
+  uses UUID `chunk_id`. We take the first 8 bytes of the UUID
+  (big-endian). Birthday-paradox safe to ~2^32 chunks per table.
+- Eventual consistency: Coral's `POST /data` returns on Kafka-accept,
+  not on visibility. `embed_worker` marks `vector_indexed_at` at the
+  same point — the search-visibility gap (~10-30s) is the same
+  asymmetry any async-indexing pipeline has.
+- Race-safety: documented as ⚠ in `base.py`'s audit table; Coral
+  serializes concurrent `POST /catalog/tables` server-side so peer
+  startups mostly converge, but no advisory-lock-grade guarantee
+  like pgvector.
+
+### What this PR does NOT do
+
+- No production migration. prod + demo stay on `pgvector`. A future
+  PR may add an opt-in seahorse-db validation tier; that's a separate
+  decision based on operational ergonomics of running the 7-container
+  SeahorseDB stack.
+- No integration test against a live Coral. The driver is type-checked
+  and unit-friendly; an e2e is the next PR once we decide where the
+  SeahorseDB stack lives (host machine vs CI runner vs neither).
+- No proxy/frontend change.
+
+### Verification
+
+- `bash scripts/check.sh` — green (ruff + mypy + tsc + vitest + secrets).
+- `mypy --python-version 3.14 app/services/vector_store/` —
+  `Success: no issues found in 7 source files`.
+
+---
+
+## 0.6.6 — 2026-06-05  *(patch — clear the 18 mypy errors 0.6.5 exposed + exact-pin runtime deps)*
+
+The 0.6.5 Python 3.11 → 3.14 bump closed the "CI runs a different
+analyzer than dev" gap but left 18 mypy errors actually surfaced —
+the older runtime had been hiding them via wider stub inference.
+This release works through every one of them and pins runtime deps
+so the image's behavior is also reproducible.
+
+### Cleared 18 mypy errors (no behavior change)
+
+- `app/services/git_service.py` (14): `commit.tree.traverse()` yields
+  `Tree | Blob | Submodule | tuple` and we were narrowing with
+  `item.type == "blob"`. Replaced with `isinstance(item, Blob)`, which
+  both narrows for the type checker AND skips submodule pointers /
+  nested trees explicitly. `repo.iter_commits(**kwargs)` — gitpython's
+  stub forbids `**kwargs` splatting (each named param is individually
+  typed); spelled out the argument shapes. `c.message` is typed as
+  `str | bytes`; normalised via `str(...)`. `d.b_path`/`d.a_path` and
+  `item.path` come back as `str | PathLike[str] | None`; made the str
+  narrowing explicit with `str(...)` + None-skip.
+- `app/services/events_publisher.py` (1): `redis-py`'s `xadd` stub
+  takes the wider `dict[bytes|bytearray|memoryview|str|int|float, …]`;
+  dict invariance means our narrower `dict[bytes, bytes]` was
+  rejected. Widened the helper's return type and added a
+  `cast(dict, fields)` at the call site.
+- `app/services/vector_store/qdrant.py` (1): qdrant-client 1.13+
+  narrowed `timeout` to `int | None` even though the runtime still
+  accepts floats. Changed `30.0` → `30`.
+- `mcp_server/server.py` (2): `_handle_get` reused the identifier
+  `doc` for two different shapes — a `dict` in the version branch, a
+  `DocumentResponse` on the un-versioned path. Renamed the latter to
+  `response`.
+
+`mypy --python-version 3.14` now reports `Success: no issues found
+in 119 source files`.
+
+### Runtime deps exact-pinned
+
+The main `dependencies` block in `backend/pyproject.toml` was
+floor-only (`>=`); a silent resolver upgrade could swap backend image
+behavior on a re-deploy. Bumps are now an explicit code change. Pins
+captured from the resolved set in the 0.6.5 image (post Python 3.14
+base rebuild) and verified end-to-end:
+- `fastapi==0.136.3`, `uvicorn[standard]==0.49.0`, `pydantic==2.13.4`
+- `asyncpg==0.31.0`, `pgvector==0.4.2`, `gitpython==3.1.50`
+- `python-frontmatter==1.3.0`, `httpx==0.28.1`, `mcp[cli]==1.27.2`
+- `pyyaml==6.0.3`, `python-multipart==0.0.32`, `pyjwt==2.13.0`
+- `bcrypt==5.0.0`, `boto3==1.43.23`, `qdrant-client==1.18.0`
+- `kiwipiepy==0.23.1`, `redis==8.0.0`
+
+### Verification
+
+- `bash scripts/check.sh` — green.
+- `bash backend/tests/test_publications_e2e.sh` — 97/97.
+- `bash backend/tests/test_mcp_e2e.sh` — 76/76.
+- `bash backend/tests/test_hybrid_search_e2e.sh` — 25/25.
+
+---
+
+## 0.6.5 — 2026-06-05  *(patch — pin static-analysis tooling + Python 3.11 → 3.14)*
+
+### Python 3.11 → 3.14
+
+`backend/Dockerfile`'s `FROM python:3.11-slim` was four years stale
+(3.11 released 2022-10) and starting to gate us out of newer typing
+features and faster MCP / pgvector library cuts. Bumped to
+`python:3.14-slim` end-to-end:
+
+- `backend/Dockerfile`: `python:3.11-slim` → `python:3.14-slim`.
+- `backend/pyproject.toml`: `requires-python = ">=3.11"` → `>=3.14`,
+  `[tool.mypy] python_version = "3.11"` → `"3.14"`,
+  `[tool.ruff] target-version = "py311"` → `"py314"`.
+- `.github/workflows/check.yml` + `backend-pytest.yml`:
+  `python-version: '3.11'` → `'3.14'`.
+- `scripts/check.sh` mypy `--python-version 3.11` → `3.14`.
+
+Dependency-wheel check before pulling the trigger:
+- `kiwipiepy 0.23.1` — Cython native binding; ships cp314 wheels for
+  Linux x86_64/aarch64, macOS, Windows. ✓
+- `asyncpg 0.31.0`, `bcrypt 5.0.0` — native; ship cp314. ✓
+- `pgvector 0.4.2`, `pyjwt 2.13.0`, `mcp 1.27.2` — pure-python sdist,
+  Python-version-agnostic. ✓
+
+Local docker-compose build of `python:3.14-slim`-based backend image
+succeeded; all three regression suites passed against the rebuilt
+backend:
+- `test_publications_e2e.sh` — 97/97
+- `test_mcp_e2e.sh` — 76/76
+- `test_hybrid_search_e2e.sh` — 25/25
+
+### Static-analysis tooling pin
+
+`backend/pyproject.toml`'s `dev` deps and `.github/workflows/check.yml`'s
+tool install line both used floor-only version specifiers (`>=`) for
+`mypy`, `ruff`, `bandit`, and `detect-secrets`. A silent upgrade of one
+of those tools (or their transitive type-stub deps) could flip the same
+commit's CI from pass→fail or fail→pass on a re-run, without anyone
+noticing the gate had changed under them.
+
+This is exactly the shape of the 0.6.4 surprise: local `mypy 2.1.0`
+showed 18 errors on the exact ref CI marked green. Both ends ran
+`mypy 2.1.0`, but the runtime Python (CI 3.11 vs local 3.13) and the
+lack of any explicit stub pin made the analyzer reach different
+conclusions. We caught it by accident because of an unrelated production
+incident — the gate that's supposed to catch type regressions wasn't
+itself reproducible.
+
+### How
+
+- `backend/pyproject.toml`'s `dev` deps are exact-pinned: `pytest==9.0.3`,
+  `pytest-asyncio==1.3.0`, `ruff==0.15.16`, `mypy==2.1.0`,
+  `bandit[toml]==1.9.4`.
+- `.github/workflows/check.yml` mirrors the same exact pins on its
+  direct install line (it pre-dates the pyproject `dev` group and
+  installs the four tools directly, not via `pip install -e '.[dev]'`,
+  so it has to keep its own list in sync — comment added).
+- `backend-pytest.yml` already uses `pip install -e '.[dev]'`, so it
+  picks up the pyproject pins automatically.
+
+Bumps to any of these tools are now an explicit code change, not a
+`pip install` side-effect.
+
+### Honest scope note
+
+This release does **not** fix the 18 local mypy errors in
+`git_service.py` / `mcp_server/server.py` / `qdrant.py` /
+`events_publisher.py` that the Python 3.11-vs-3.13 mismatch surfaced.
+Those need a separate look — most appear to be real type ambiguities in
+code we didn't touch in the 0.6.x line. Tracked as a follow-up.
+
+Only the four lint/type/sec tools are pinned. Runtime deps in the main
+`dependencies` block are still floor-only. The risk profile is asymmetric
+— a runtime-dep silent upgrade tends to fail loud (import errors, API
+mismatch), while an analyzer silent upgrade fails quiet (gate changes
+meaning). Starting where the silent-failure risk is highest; runtime
+pinning is a separate follow-up worth doing once we have a lock-file
+workflow.
+
+### Verification
+
+- `pip install -e '.[dev]'` resolves to the exact versions above.
+- CI install step uses the same pins.
+- 0.6.4 prod incident's reproducibility gap is closed for this category
+  of failure.
+
+---
+
+## 0.6.4 — 2026-06-05  *(patch — `ensure_collection` race-safety, post-mortem of a real prod incident)*
+
+### What happened
+
+The 0.6.2 BM25-fallback feature changed `vector_index.chunks.dense`
+from `NOT NULL` to nullable and the HNSW index from full to partial
+(`WHERE dense IS NOT NULL`). On the prod rollout the migration step
+in `PgvectorStore.ensure_collection` ran on a 350k-chunks table and
+needed ~533 MB of shared memory for the HNSW graph build — more
+than the 512 Mi `/dev/shm` the postgres pod had been given. The
+`CREATE INDEX` aborted mid-build, leaving the schema with **no
+dense index at all**. Every search after that hit a seq scan and
+timed out (504 nginx); the timeout cancelled the in-flight
+`ensure_collection`, the next request found
+`_ensured_collection=False` and started another build, and so on
+ad infinitum.
+
+Even at a single uvicorn worker the cancel-driven retry looked
+exactly like multi-process contention: four concurrent CREATE
+INDEX statements visible in `pg_stat_activity`, none ever
+committing.
+
+Manual recovery: scale backend to 0, terminate the in-flight
+builds, build the index once from a psql session with
+`maintenance_work_mem='2GB'`, scale backend back to 1. None of
+this was the user's job.
+
+### The fixes
+
+1. **`PgvectorStore.ensure_collection` is now race-safe across
+   processes.** Three layers:
+   - instance flag (hot-path bool read, unchanged)
+   - `asyncio.Lock` (same-process callers serialize, unchanged)
+   - **new:** `pg_advisory_xact_lock(hash(schema))` (cross-process
+     callers serialize on a transaction-scoped PG lock that
+     auto-releases on commit/rollback/conn-close — a cancelled
+     CREATE INDEX cannot strand it).
+2. **Index swap is now atomic.** Pre-0.6.4 did `DROP legacy
+   idx_vi_chunks_dense` then `CREATE partial idx_vi_chunks_dense`;
+   a failure between the two left the schema dense-index-less.
+   Now: `CREATE partial idx_vi_chunks_dense_new` → `DROP legacy
+   idx_vi_chunks_dense` → `RENAME idx_vi_chunks_dense_new →
+   idx_vi_chunks_dense`, all inside the advisory-lock tx. If the
+   `CREATE` fails the legacy index stays in place and search
+   keeps working with the full-form behavior.
+3. **`maintenance_work_mem` is now set per build.** The new
+   `_build_partial_hnsw` does `SET LOCAL maintenance_work_mem =
+   '2GB'` before issuing the `CREATE INDEX`. At our scale
+   (a few hundred K rows × 1024-dim vectors) HNSW peaks well
+   above the PG default 64 MB.
+4. **`deploy/k8s/postgres.yaml` `/dev/shm` default is now 4Gi**
+   (was 512Mi). Doc-comment records the trade-off for operators
+   on much larger corpora.
+5. **`backend/tests/concurrency/test_ensure_collection_race_unit.py`**
+   — three pytest regressions against a live Postgres
+   (`AKB_TEST_DSN`): N concurrent callers serialize, legacy →
+   partial swap is atomic, idempotent on already-partial schemas.
+   Skips when no PG is reachable; docker-compose locally passes
+   3/3.
+
+### Process gaps that let this ship
+
+The 0.6.2 PR's verification was `test_publications_e2e.sh` 97/97 +
+`test_mcp_e2e.sh` 76/76. Both pass through small ephemeral vaults
+with under a hundred chunks — the HNSW rebuild was sub-second on
+that data, so neither the OOM nor the cancel race ever surfaced.
+`test_hybrid_search_e2e.sh` exists but is not part of the default
+PR gate; we didn't run it. And the prod smoke after each deploy
+exercised publications only, not search.
+
+This release's verification section explicitly lists
+`test_hybrid_search_e2e.sh` and prod search-smoke alongside the
+publications regressions; vector_store / embed_worker /
+sparse_encoder changes should run all three. The new pytest
+regressions catch the specific ensure_collection bug shape but
+they are necessarily a narrow guard — a future indexing-side
+change will only be caught by exercising search end-to-end.
+
+### Honest scope note
+
+This release does not introduce any new feature and does not
+change any external contract. It changes the schema migration
+inside `ensure_collection` to be forward-progress-safe under
+adversarial conditions (cancel storms, undersized `/dev/shm`),
+ships the corresponding `/dev/shm` deploy default, and adds a
+regression that would have caught the original failure. The
+0.6.2/0.6.3 BM25 fallback behavior is unchanged.
+
+### Verification
+
+- `bash scripts/check.sh` — green.
+- `pytest tests/concurrency/test_ensure_collection_race_unit.py` —
+  3/3 (AKB_TEST_DSN set to docker-compose PG).
+- `bash backend/tests/test_publications_e2e.sh` — 97/97.
+- `bash backend/tests/test_mcp_e2e.sh` — 76/76.
+- `bash backend/tests/test_hybrid_search_e2e.sh` against
+  docker-compose local — **operator should run this for any
+  pgvector / embed_worker / sparse_encoder change**; counts as
+  release gate from 0.6.4 on.
+
+---
+
+## 0.6.3 — 2026-06-05  *(patch — 0.6.2 review findings)*
+
+Independent review of the 0.6.2 BM25 fallback surface turned up one
+real correctness gap and a handful of hygiene items. Two larger
+suggestions (per-row reject signalling, `CONCURRENTLY` HNSW rebuild)
+were considered but kept out as over-engineering at the current scale.
+See the *Considered and rejected* section below.
+
+### Bug fix
+
+**`embed_worker` could now create useless points** when the embed API
+was disabled / failed AND the row's sparse vector was also empty
+(whitespace-only or OOV-only content). Before this PR the per-row loop
+would call `vector_store.upsert_one(dense=None, sparse_indices=[])`,
+producing a pgvector row with `dense IS NULL AND sparse_terms = '{}'`
+(invisible to both legs) or a Qdrant `vectors={}` upsert (rejected by
+the driver with a less specific error than the actual cause). Now the
+worker fails such rows up-front with `"no indexable signal (no dense
+embedding + empty sparse)"`; they go through normal retry semantics
+and stop accumulating in the index. The pre-0.6.2 atomic-pair check
+covered this implicitly — 0.6.2's relaxation re-opened the gap.
+
+### Hygiene
+
+- **`vector_store.base.has_dense(dense)`** — single source of truth
+  TypeGuard for "this point has a usable dense vector". All three
+  drivers (`pgvector`, `qdrant`, `seahorse`) and `embed_worker` now
+  branch on this helper instead of inlining three different falsy
+  checks. mypy narrows `dense` to `list[float]` inside the guarded
+  block, so call sites no longer need redundant asserts.
+- **`embeddings_padded` is now `list[list[float] | None]`**, padded
+  with explicit `None` instead of `[]` and a falsy-game comment. The
+  three-branch comment block at the top of stage 2 was shortened — the
+  "per-row reject" sub-case the 0.6.2 PR drafted around turned out
+  not to be distinguishable from a batch outage without a richer
+  upstream contract; if that ever becomes a signal we want, surface it
+  from `generate_embeddings` directly.
+- **Mismatched batch length is now an explicit error log + outage
+  promotion** rather than a silent zip-shorter footgun
+  (`if embeddings and len(embeddings) != len(batch): logger.error(…)`).
+- **`pgvector.ensure_collection` legacy-HNSW check** now inspects
+  `pg_index.indpred IS NOT NULL` instead of `"WHERE" in indexdef`. The
+  textual probe was correct on PG 16 but brittle across PG version
+  upgrades that could re-format `indexdef`; `indpred` is the
+  catalog's stable boolean for "this index has a WHERE clause".
+- **`config.py` `embed_base_url` comment** said "required" — stale
+  since 0.6.2. Now reads "Optional; unset disables the dense leg →
+  BM25-only retrieval".
+- **`vector_store.base.upsert_one` docstring** was claiming atomicity
+  across all drivers ("stores dense + sparse + payload atomically").
+  pgvector joins the caller's PG transaction; Qdrant and Seahorse
+  ignore `conn` and rely on `chunk_id` idempotence for recovery. Now
+  spelled out explicitly.
+
+### Considered and rejected
+
+- **Per-row reject signalling.** The review flagged that a single-row
+  `[]` from the embed API would look identical to a batch outage at
+  the worker. Investigated and kept out: `generate_embeddings`
+  currently has no upstream contract for partial responses (a missing
+  row is treated as a batch-level failure inside `index_service`), so
+  distinguishing the case at the worker would just be a guard for a
+  scenario we can't actually produce. If the upstream ever surfaces
+  per-row rejects, the worker should grow a `dense=[]` branch then;
+  pre-emptive guards for impossible states age into liabilities.
+- **HNSW `CREATE CONCURRENTLY`.** At the current single-digit-K chunks
+  scale the rebuild is sub-second; CONCURRENTLY's own failure mode
+  (an `INVALID` leftover index that `IF NOT EXISTS` then refuses to
+  recreate) is genuinely worse than the brief lock. The doc-comment
+  records this trade-off so a future maintainer at a much larger
+  chunks count can re-evaluate.
+
+### Verification
+
+- `bash scripts/check.sh` — ruff + mypy + tsc + vitest + secrets pass.
+- `bash backend/tests/test_publications_e2e.sh` — 97/97.
+- `bash backend/tests/test_mcp_e2e.sh` — 76/76.
+
+---
+
+## 0.6.2 — 2026-06-05  *(patch — BM25 fallback when the embed API is unavailable)*
+
+### Bug fix
+
+Before 0.6.2, `embed_worker` treated dense+sparse as an atomic pair:
+if the embedding API was unreachable (or `embed_base_url` empty),
+the whole batch was `_mark_failure`'d and nothing landed in
+`vector_index`. Result: self-hosted instances that didn't configure
+an embedding endpoint, and any temporary upstream outage, dropped to
+**0 search hits across the affected vault** — not "embedding leg
+degraded, BM25 still works", which is what the search-pipeline
+docstrings and the `embed_base_url` doc-comment implied.
+
+The fix removes the all-or-nothing coupling end-to-end so dense is
+genuinely optional:
+
+- **`vector_store.upsert_one`**: signature now
+  `dense: list[float] | None` across all three drivers. `None` means
+  "store this point with sparse only". pgvector writes a NULL column;
+  qdrant omits the dense entry from its named-vectors dict; seahorse
+  omits the column from the upsert row.
+- **`vector_index.chunks.dense`** column is now nullable, and the
+  HNSW index is *partial* (`WHERE dense IS NOT NULL`) so sparse-only
+  rows don't get indexed for dense KNN and don't appear as
+  zero-vector neighbours in the dense leg. The dense leg's
+  `ORDER BY dense <=> $1` SQL gains the matching `WHERE dense IS NOT
+  NULL` filter. Existing deployments idempotently lose the `NOT NULL`
+  constraint and have the legacy full HNSW dropped+rebuilt as partial
+  at the next `ensure_collection` (startup).
+- **`embed_worker`** distinguishes three cases that used to all
+  bucket as failure:
+  1. `embed_base_url == ""` → intentional, no embed call attempted,
+     log at DEBUG, every row → sparse-only indexed, `succeeded`
+     counter increments normally.
+  2. embed configured + transient outage → log WARNING once per
+     batch, fall through to sparse-only for this batch (do not
+     retry-storm). The `_mark_failure` / `vector_retry_count` flow is
+     reserved for problems the worker can actually fix on its own
+     next pass (sparse encoder failure, vector_store unavailable).
+  3. sparse encoder or vector_store failure → real `_mark_failure`,
+     normal retry semantics unchanged.
+
+The search side already had the symmetric `query_dense=None` path
+in `search_service` and the driver `hybrid_search` implementations,
+so the sparse-only fallback became end-to-end correct as soon as
+the indexing side stopped withholding rows.
+
+### Manual verification
+
+Reproduces the embed-disabled scenario directly: set `embed_base_url:
+""` in `config/app.yaml`, rebuild + restart the backend, create a doc,
+wait for `/health` `pending=0`, then search. The doc lands in
+`vector_index.chunks` with `dense IS NULL` + posting rows populated,
+and the BM25 leg returns it. Confirmed in the docker-compose dev
+stack:
+
+```
+score=0.0164 title="Symantec DLP issue"
+total=1
+```
+
+Regression: `bash backend/tests/test_publications_e2e.sh` 97/97,
+`bash backend/tests/test_mcp_e2e.sh` 76/76.
+
+### Out of scope (follow-ups)
+
+- **Automatic dense backfill** when an embed endpoint is configured
+  *after* sparse-only rows already exist. The current worker keeps
+  picking up `vector_indexed_at IS NULL` rows; sparse-only rows have
+  it set, so they're considered done. A separate explicit reindex
+  tool (or a `dense_pending` flag column) is the cleanest next step.
+- pgvector `posting`-shape: this release only validated the `arrays`
+  shape (the dev / prod default) end-to-end. The `posting`-shape code
+  paths went through the same diff and compile, but were not
+  e2e-exercised. Operators on the posting shape should re-run the
+  regression suite before pinning `:0.6.2`.
+
+---
+
+## 0.6.1 — 2026-06-04  *(patch — three latent bugs around the 0.6.0 surface, plus envelope close-out)*
+
+Three honest bug fixes that surfaced during the post-0.6.0 review, plus
+the leftover piece of the 0.5.6 error-envelope unification. No contract
+changes beyond a single new stable error code; no migration needed.
+
+### Bug fixes
+
+1. **`_handle_publication_snapshot` mis-classified non-input failures as
+   `INVALID_ARGUMENT`.** The handler caught every `PublicationError` and
+   flattened it to `INVALID_ARGUMENT`, even when `create_snapshot` raised
+   502 (S3 upload failure — not the caller's fault) or 404 (the row
+   vanished between the lookup and the locked re-read). Now maps by
+   `e.status_code`: 404 → `NOT_FOUND`, 4xx → `INVALID_ARGUMENT`, 5xx →
+   `INTERNAL` (new code, see below). Callers that branched on `code` to
+   decide whether to retry vs. fix their input were getting the wrong
+   answer for the storage-failure path.
+
+2. **`akb_unpublish(uri=…)` URI branch wasn't vault-bound at the SQL
+   layer.** The slug branch already passed `expected_vault_id` to the
+   service for belt-and-suspenders IDOR protection; the URI branch
+   relied solely on the URI encoding the vault. The URI grammar
+   guarantees that holds in practice, but having one model on the slug
+   branch and a different model on the URI branch was itself a smell.
+   `delete_publications_for_document` / `_for_file` now accept optional
+   `expected_vault_id`, and the URI branch threads `access["vault_id"]`
+   through. Same explicit binding on both sides.
+
+3. **MCP `call_tool` last-resort `except Exception` broke the 0.5.6
+   error envelope.** 0.5.6 (`c00791e`) collapsed every error response
+   to `{error, code, hint?, details?}`, but the dispatch-level catch
+   was missed and kept returning bare `{error: str(e)}` — no `code`.
+   Any handler that `raise`d instead of returning `err(...)` therefore
+   shipped a response that broke the canonical envelope contract.
+   Catch-all now returns `err(str(e), code=INTERNAL)`, so every
+   response path — success, expected failure, and unhandled exception —
+   carries the same shape.
+
+### New error code
+
+- `INTERNAL = "internal"` in `app/util/errors.py`. Used by the
+  dispatch's last-resort catch and by any handler that needs to surface
+  a 5xx-class failure without falsifying caller-side blame.
+
+### Hygiene (no behavior change)
+
+- `Mode.ALL` constant removed — was dead after 0.6.0 dropped the
+  publish-time `mode` option.
+- `delete_publication()` collapsed to slug-only — no caller passes
+  `publication_id` after 0.6.0 (routes use slug, MCP was always
+  slug-only); the dual-shape signature was just `# old.` framing.
+- `resolve_table_query_publication` no longer says
+  `publication.get("mode", Mode.LIVE)` — `mode` is a NOT NULL column
+  with `'live'` default, so the `.get` default was a fallback that
+  could never fire. Replaced with direct subscript so the code reads
+  honestly.
+- `publication_meta` had a `elif rt == DOCUMENT: meta["title"] = ...`
+  branch that re-assigned the same value `meta` already carried from
+  three lines above. Dead elif removed, intent commented.
+- `_PUBLIC_FIELDS` renamed to `_PUBLIC_PASSTHROUGH_FIELDS` with a
+  docstring naming the two derived keys (`share_url`,
+  `password_protected`) that `to_public_dict` adds — single place to
+  extend.
+- `_row_to_internal_dict` previously accepted an already-parsed dict
+  as a silent third branch between the JSON string and None cases.
+  Added an explicit `isinstance(qp, dict)` check + clear error for any
+  other type.
+- `_handle_unpublish` URI branch replaced a `not parsed.identifier`
+  defensive guard (unreachable after the kind narrowing above it) with
+  `assert parsed.identifier is not None`. Same mypy narrowing, honest
+  intent.
+- Stale comment on the table_query default title removed.
+
+### Tests
+
+- `backend/tests/test_publications_e2e.sh` — 97/97 (unchanged from 0.6.0;
+  the response-shape assertions added in 0.6.0 still pass).
+- `backend/tests/test_mcp_e2e.sh` — 76/76.
+
+### Verification
+
+Six agent-driven prod scenarios after each deploy step (doc publish,
+file publish, snapshot-rejection-for-doc, `unpublish(uri=<file_uri>)`,
+table_query publish→snapshot, list-item-shape-matches-publish) — all
+clean. Existing 24 active prod publications keep resolving normally;
+no schema migration, contract changes only.
+
+### Migration
+
+None. 0.6.0 callers see the same external shape; only the dispatch
+catch-all now returns `code: "internal"` in places that previously
+returned `{error: "..."}` with no `code` field. If anything, this is a
+contract *strengthening* (envelope is now total).
+
+---
+
+## 0.6.0 — 2026-06-04  *(BREAKING — publication tool surface rewritten)*
+
+The `akb_publish` / `akb_unpublish` / `akb_publications` /
+`akb_publication_snapshot` quartet had accumulated several
+inconsistencies that confused agent callers: response shapes differed
+between the four tools, `publication_id` and `slug` competed for the
+"identifier" role, `public_url` / `public_url_full` / `public_base`
+all came back together with a null-fallback contract, the `mode`
+option overlapped with the dedicated snapshot tool, and
+`akb_unpublish(uri=...)` silently rejected file URIs (a bug, not a
+design choice). This release replaces the whole surface with a single,
+consistent shape.
+
+### One canonical publication dict
+
+Every endpoint (`akb_publish`, `akb_publications`,
+`akb_publication_snapshot`, `POST /publications/{vault}/create`,
+`GET /publications/{vault}`) now returns the exact same dict shape:
+
+```jsonc
+{
+  "slug": "...",                  // sole external identifier
+  "share_url": "https://...",     // always absolute (see below)
+  "resource_type": "document|file|table_query",
+  "resource_uri": "akb://...|null",
+  "vault": "...",                 // human-readable vault name
+  "title": "...|null",
+  "mode": "live|snapshot",
+  "expires_at": "...|null",
+  "max_views": null|N,
+  "view_count": 0,
+  "allow_embed": true,
+  "section_filter": "...|null",
+  "password_protected": false,
+  "created_at": "...",
+  "snapshot_at": "...|null",
+  // table_query only:
+  "query_sql": "...|null",
+  "query_vault_names": [...]|null,
+  "query_params": {...}
+}
+```
+
+**Removed fields** (no longer surfaced to any client):
+`publication_id`, `public_url`, `public_url_full`, `public_base`,
+`snapshot_s3_key`.
+
+**Internal-vs-public dict boundary**: `publication_service` now has
+exactly two helpers — `_row_to_internal_dict(row)` for code that needs
+`id` / `password_hash` / `snapshot_s3_key` (route password check,
+S3 fetch), and `to_public_dict(internal)` for every response. There
+is no `_enrich_publication` post-processing step anymore.
+
+### `AKB_PUBLIC_BASE_URL` is now startup-required
+
+`share_url` is always an absolute URL. The lifespan refuses to start
+if `AKB_PUBLIC_BASE_URL` is unset (alongside `AKB_JWT_SECRET` and
+`AKB_DB_PASSWORD`). No nullable URL field, no fallback chain, no
+client-side string concatenation.
+
+### `akb_unpublish(uri=...)` now accepts file URIs
+
+The old code path called `split_uri(uri, expected_type="doc")`,
+silently rejecting file URIs even though `akb_publish(uri=file_uri)`
+worked. Now the URI's `kind` drives the cascade:
+`doc` → `delete_publications_for_document`,
+`file` → `delete_publications_for_file` (previously defined but never
+called). table_query publications have no resource URI, so they
+remain slug-only.
+
+Response is now `{"deleted": N}` (was a mix of
+`{"published": false, "deleted": bool}` and `{"published": false,
+"deleted_publications": N}`).
+
+### `mode` is no longer a publish-time option
+
+`akb_publish` and `POST /publications/{vault}/create` no longer accept
+a `mode` parameter. Every publication is created with `mode='live'`.
+Snapshot is a state transition reached through
+`akb_publication_snapshot(slug=...)` — the only path that ever made
+sense, since `mode='snapshot'` at create time meant nothing for
+document/file publications.
+
+### REST `publication_id` URL params replaced with `slug`
+
+`DELETE /publications/{vault}/{publication_id}` →
+`DELETE /publications/{vault}/{slug}`.
+`POST /publications/{vault}/{publication_id}/snapshot` →
+`POST /publications/{vault}/{slug}/snapshot`.
+
+The internal-only `publication_id` UUID is no longer accepted as a URL
+path identifier, no longer returned in responses, and no longer
+expected as an unpublish input — `slug` is the single external handle.
+
+### `akb_publication_snapshot` input simplified
+
+Accepts only `{slug}`. The owning vault is resolved from the
+publication row and writer access is verified against it (no need
+for the caller to pass `vault` — and the prior surface let a writer
+on vault A trigger a snapshot of vault B's publication when they
+guessed the slug, which is now structurally impossible).
+
+### `section` → `section_filter`
+
+The `akb_publish` / REST publish input now uses `section_filter`,
+matching the response field name and the DB column. Document-only.
+
+### Frontend response keys migrated
+
+`frontend/src/lib/api.ts` exports a typed `Publication` interface
+matching the new dict. `frontend/src/pages/publications.tsx` uses
+`p.slug` for all keying and `p.share_url` for the "Copy link"
+button. `frontend/src/components/publish-options-dialog.tsx` already
+read `result.slug`, so it was unchanged.
+
+### Migration
+
+Callers using the MCP tools:
+
+| 0.5.x | 0.6.0 |
+|---|---|
+| `akb_publish(..., mode="snapshot")` | `akb_publish(...)` then `akb_publication_snapshot(slug=...)` |
+| `akb_publish(..., section="...")` | `akb_publish(..., section_filter="...")` |
+| `akb_publication_snapshot(vault=..., slug=...)` | `akb_publication_snapshot(slug=...)` |
+| reading `result.public_url_full` | `result.share_url` |
+| reading `result.publication_id` | `result.slug` (it was always the right identifier) |
+
+REST callers:
+
+| 0.5.x | 0.6.0 |
+|---|---|
+| `DELETE /publications/{vault}/{publication_id}` | `DELETE /publications/{vault}/{slug}` |
+| `POST /publications/{vault}/{publication_id}/snapshot` | `POST /publications/{vault}/{slug}/snapshot` |
+| `POST /publications/{vault}/create` body `{section: ...}` | `{section_filter: ...}` |
+| `POST /publications/{vault}/create` body `{mode: ...}` | (removed — call snapshot endpoint) |
+
+### Tests
+
+`backend/tests/test_publications_e2e.sh` reshaped end-to-end (slug-only
+routes, response-shape assertions for the removed fields, new
+`akb_unpublish(uri=file_uri)` regression test that exercises the bug
+the prior surface couldn't fix). `backend/tests/concurrency/repro_pub_security.sh`
+moved off `publication_id` onto `slug`.
+
+---
+
+## 0.5.8 — 2026-06-04  *(minor breaking — `query` alias removed)*
+
+Whole-repo "half-done migration" sweep. The 0.5.4–0.5.7 stream
+closed several files cleanly but left a few dead seams behind. This
+release retires them.
+
+### `query` alias on `akb_list_vaults` + `akb_browse` removed
+
+The `query` arg was kept "for one minor release" when `filter` became
+the canonical name (0.3.x era — `akb_search.query` started to collide
+with `query` as filter). That release window expired five versions
+ago. Both `tools.py` inputSchemas dropped the `query` property and
+`_filter_arg` (`mcp_server/server.py`) no longer reads it.
+
+**Breaking note**: a caller still passing `query="..."` now hits the
+0.5.4 unknown-arg gate and gets a fuzzy-hint response pointing at
+`filter`. Frontend uses neither; akb-mcp proxy is pass-through. No
+known external caller needs migration, but flagged here so anyone who
+finds a 4xx in logs can self-diagnose.
+
+### `build_table_name_map` backward-compat keys deleted
+
+`table_data_repo.build_table_name_map` was carrying two extra keys per
+table — the raw display name and `replace("-", "_")` — "for pre-fix
+callers". After 0.5.5's `pg_short_name` keying landed and the prod
+legacy hyphen / non-ASCII tables were renamed (out-of-band rename in
+this session), neither key is reachable: the SQL tokenizer accepts
+only `[A-Za-z_][A-Za-z0-9_]*`, and no table with a hyphen in its
+display name exists any more. Two lines + comment removed.
+
+### Frontend delete-vault dialog text
+
+`delete-vault-dialog.tsx` still promised the dialog would wipe
+"sessions, memories" alongside other vault content. Those PG tables
+were dropped by migration 031 (0.5.0). Wording updated to match
+what's actually deleted.
+
+### Docstring drift
+
+- `ParsedUri` docstring no longer claims "3-tuple unpack backward
+  compatibility" — every call site in the codebase reads parsed
+  attributes (`parsed.vault`, `parsed.kind`, …), never unpacks.
+  Field-order rationale rewritten as plain surface description.
+- `frontend/src/lib/api.ts` 7-line "Memory client surface removed in
+  v0.5.0" tombstone compressed to a one-liner that describes the
+  current state instead of the deleted past.
+
+### Out of scope / deferred
+
+- `_TABLE_NAME_RE` continues to reject hyphen / non-ASCII at create
+  time. Existing legacy tables were renamed in this session; making
+  create permissive is a separate design (URI escaping, column rules,
+  frontend display).
+- Boot-time migration list in `db/postgres.py` — 11 entries, all
+  idempotent and cheap. Trimming them needs a "schema-state snapshot"
+  policy decision (when does an applied migration get folded into
+  `init.sql` and dropped from the runner?). Tracked separately.
+- `app/main.py:196` `/health` field still emits a raw `{"error": str(e)}`
+  — intentional exception per 0.5.7.
+
+### Verified
+
+Unit 16/16; e2e green against 0.5.8 locally on the suites this PR
+touches (mcp, security, edit, collection, pg_rbac). Frontend type
+check + lint pass.
+
+## 0.5.7 — 2026-06-03
+
+Post-0.5.6 cleanup pass — five findings from a code-quality audit
+of the last four releases (0.5.4–0.5.6).
+
+### REST `sql_name` symmetry (issue #110 follow-up)
+
+`GET /api/v1/tables/{vault}` now includes `sql_name` on each table
+item, matching what MCP `akb_browse` started returning in 0.5.5. REST
+clients were unintentionally excluded from the contract — they had to
+guess the sanitisation rule the same way the original seahorse-mcp
+table viewer did before #110. Additive field; no breaking change.
+
+### Catalogue-enforcement test (drift gate)
+
+`tests/test_errors_unit.py` gains two AST-level sync tests:
+
+- `test_every_err_call_uses_catalogue_constant` — every `err(code=X)`
+  call in `app/` + `mcp_server/` must use a constant from
+  `app/util/errors.py`, not an ad-hoc string. Catches the next
+  contributor who writes `code="some_new_thing"` inline.
+- `test_catalogue_has_no_orphan_constants` — every constant in the
+  catalogue must be imported somewhere. Catches forward-declared
+  codes that get carried release-to-release without ever shipping a
+  call site (`CROSS_VAULT_LINK`, `INTERNAL_ERROR` were exactly this
+  in 0.5.6 — see "Dropped" below).
+
+Together these make the 0.5.6 "one shape" promise self-enforcing
+rather than depending on review vigilance.
+
+### Dropped
+
+- `CROSS_VAULT_LINK`, `INTERNAL_ERROR` — declared in 0.5.6's
+  catalogue but never imported. YAGNI; re-add when the first call
+  site lands.
+
+### Internal cleanup (no behaviour change)
+
+- `app/services/table_service.py`: dropped the late `import re as _re`
+  alias — the file already has `import re` at the top, and `_re.compile`
+  was only used in two patterns that now just say `re.compile`.
+- `_enrich_undefined_error` docstring rewritten to spell out the
+  canonical envelope it now returns (was accurate but vague — easy to
+  mis-read by a future maintainer).
+
+### Tests
+
+Unit: 16/16 (5 envelope shape + 2 catalogue sync + 3 fuzzy_hint
++ 1 TOOLS↔_HANDLERS sync + 5 table identifier).
+
+E2E: re-ran the suites touched by 0.5.4–0.5.6 (mcp, security, edit,
+collection_lifecycle, pg_rbac, stdio_files, put_file_param) against
+0.5.7 locally — all green.
+
+## 0.5.6 — 2026-06-03  *(breaking error-response shape)*
+
+Error responses across the backend now share one envelope. Until
+0.5.5 there were ~6 distinct shapes — bare `{error}`, `{error,
+code}`, `{error, code, pg_sqlstate}`, `{error, hint, available_*}`,
+`{error, message, hint}` — and every new handler that wanted to
+surface a hint or metadata reinvented a slightly different one.
+Agents that wanted to auto-recover had to learn each case's field
+names; new error paths kept proliferating new shapes.
+
+### Canonical shape
+
+Every error return from `akb_*` MCP tools and the REST surface now
+matches:
+
+```json
+{
+  "error":   "<human-readable message>",
+  "code":    "<stable enum>",
+  "hint":    "<optional self-correction guidance>",
+  "details": { "<optional case-specific metadata>": "..." }
+}
+```
+
+`error` + `code` are always present. `hint` and `details` are
+opt-in. **Top-level meta fields that used to live alongside `error`
+have moved into `details`** — `available_columns`,
+`available_tables`, `available_arguments`, `pg_sqlstate`,
+`doc_count` / `file_count` / etc. on a non-empty-collection error.
+
+### Code catalogue (initial)
+
+Stable strings, defined in `app/util/errors.py`:
+
+| code                | When                                                                     |
+|---------------------|--------------------------------------------------------------------------|
+| `not_found`         | Resource doesn't exist (vault, doc, table, version, publication, user)    |
+| `permission_denied` | PG ACL denied (cross-vault probe); `details.pg_sqlstate` carries SQLSTATE |
+| `vault_archived`    | Write attempted against an archived vault                                 |
+| `invalid_argument`  | Generic argument-shape problem (missing required, wrong format, …)        |
+| `invalid_uri`       | `akb://…` URI couldn't be parsed                                          |
+| `invalid_path`      | Collection / file path failed normalisation                               |
+| `unknown_argument`  | Tool called with an arg key not in its schema (0.5.4)                     |
+| `unknown_tool`      | `_dispatch` got a tool name not in `_HANDLERS`                            |
+| `conflict`          | OCC mismatch / non-empty collection delete without `recursive`            |
+| `no_op`             | Update request had nothing to update                                      |
+| `edit_failed`       | `akb_edit` couldn't apply (no match / non-unique / empty old_string)      |
+| `multi_statement`   | `akb_sql` got `;`-separated statements                                    |
+| `method_not_allowed`| `akb_sql` got DDL or other non-DML                                        |
+| `sql_error`         | Generic PG error after enrichment                                         |
+| `undefined_column`  | SQL column doesn't exist; `details.available_columns` + `hint`            |
+| `undefined_table`   | SQL relation doesn't exist; `details.available_tables` + `hint`           |
+| `cross_vault_link`  | (reserved for future link cross-vault rejection)                          |
+| `self_link`         | `akb_link` source == target                                               |
+| `internal_error`    | Uncategorised exception fall-through (prefer a specific code over this)   |
+
+### Breaking changes
+
+If you parse error responses programmatically:
+
+1. **`error` is now always a human message**, not sometimes a code.
+   The old `{"error": "edit_failed", "message": "..."}` shape is
+   gone — use `code == "edit_failed"` and read `error` for the
+   message.
+2. **Aux fields moved under `details`**. `response.available_columns`
+   → `response.details.available_columns`. Same for
+   `available_tables`, `available_arguments`, `pg_sqlstate`,
+   `doc_count` / `file_count` / `sub_collection_count` / `table_count`
+   on `akb_delete_collection`.
+3. **`hint` stays top-level** (it's the dominant self-correction
+   signal — burying it under `details` would hurt agent UX).
+
+The frontend uses only `error` (verified — `frontend/src/lib/api.ts`
+throws `new Error(body.error || body.detail)`) and the akb-mcp
+stdio proxy is pass-through, so neither needs changes. Direct REST
+clients and agents that inspected the aux fields by their old
+top-level names need to look one level deeper.
+
+### Tests
+
+- `test_errors_unit.py` (new, 5 cases): envelope shape — minimal,
+  with hint, with details kwargs, `code` always present.
+- E2E migrated: `test_mcp_e2e.sh` (`available_columns` →
+  `details.available_columns`), `test_edit_e2e.sh` and
+  `test_security_edge_e2e.sh` (`error == "edit_failed"` →
+  `code == "edit_failed"`, `message` → `error`).
+- Full regression: unit 30 passed; main / security / pg_rbac e2e
+  green against the 0.5.6 backend.
+
+## 0.5.5 — 2026-06-03
+
+Vault tables with hyphenated or non-ASCII display names are now
+reachable via `akb_sql`, and `akb_browse` advertises the SQL identifier
+each table actually responds to. Fixes paired issues #110 + #111
+surfaced by the seahorse-mcp-agent-server table-viewer modal.
+
+### What went wrong
+
+Three call sites — `pg_table_name` (DDL), `build_table_name_map`
+(rewriter map), and the browse table-item builder — each ran their
+own slightly-different sanitisation of the display name. The
+mismatches:
+
+- `pg_table_name` collapsed every non-`[a-z0-9]` character to `_`, so a
+  Korean name like `공공사업기획` became the PG table
+  `vt_<vault>__________`.
+- `build_table_name_map` only stripped hyphens, keeping the original
+  Korean characters as map keys. The rewriter's tokenizer accepts only
+  `[A-Za-z_][A-Za-z0-9_]*`, so those Korean keys never matched and the
+  table was unreachable.
+- `akb_browse` surfaced the display name as `name` with no field that
+  exposed the SQL-side identifier, leaving clients to guess
+  AKB's sanitisation rule. The seahorse-mcp PR #193 was shipping a
+  hyphen-to-underscore client-side guess as a workaround.
+
+### Fix
+
+Single sanitisation function `_sanitize_pg_part` in
+`table_data_repo`; both `pg_table_name` and the new
+`pg_short_name` (the right half of `vt_<v>__<t>`) call it. The
+rewriter map now keys off the fully-sanitised short form, and
+`akb_browse` table items expose it as `sql_name`. Backward-compat
+keys for the previous display-name lookup are preserved.
+
+After the fix:
+
+- `akb_browse(vault="demo")` returns `{name: "pipeline-snapshots",
+  sql_name: "pipeline_snapshots", ...}` and `{name: "공공사업기획",
+  sql_name: "______", ...}`.
+- Both `SELECT * FROM pipeline_snapshots` and `SELECT * FROM ______`
+  resolve through the rewriter to the real PG table.
+
+### Tests
+
+- Unit (`test_table_identifier_unit.py`, 5 cases): pg_short_name ↔
+  pg_table_name agree on every input shape; sanitiser idempotent;
+  Korean → all-underscore; rewriter resolves all-underscore; quoted
+  identifiers untouched.
+- E2E (`test_mcp_e2e.sh` §11b, 4 cases): create hyphen + Korean
+  tables, browse exposes correct `sql_name`, round-trip the value
+  through `akb_sql` and confirm both queries return rows.
+
+## 0.5.4 — 2026-06-03
+
+MCP `_dispatch` now rejects unknown tool arguments with a fuzzy hint
+instead of silently letting them through.
+
+Before: a typo like `akb_activity(user="someone")` (real arg name:
+`author`) fell through `args.get("author")` with no signal, the filter
+quietly disabled, and the unfiltered commit list came back looking
+correct. An agent that trusts its own argument spelling has no way to
+notice. This was the exact failure mode that motivated the gate — a
+session ran a vault-permission audit, two `user=...` calls returned
+identical author-unfiltered output, and the agent reported the result
+as if the filter had applied.
+
+Fix: build `_TOOL_ARG_NAMES` from the `TOOLS` schema list at import
+time, and in `_dispatch` reject any argument key that isn't in the
+allowed set. The response uses the same `{error, hint,
+available_arguments}` shape that `table_service._enrich_undefined_error`
+already returns for SQL column / table not-exist errors, so the
+fuzzy-hint tone is uniform across the API surface.
+
+The `fuzzy_hint` helper (Top-3 close matches via `difflib`, capped
+fallback list) moves from `table_service` to `app.util.text` so both
+callers share a single implementation.
+
+New tests:
+- Unit: `fuzzy_hint` shapes (close match / fallback / truncation) and
+  AST-based `TOOLS ↔ _HANDLERS` sync assertion (no heavy imports).
+- E2E: `test_security_edge_e2e.sh` §10 covers the activity
+  `user`→`author` typo path plus a regression guard that a valid call
+  still passes through the gate.
+
+Follow-up not in this release: error-response shape standardization
+across handlers (currently ~6 distinct shapes — `{error}`,
+`{error, code}`, `{error, code, hint, available_*}`, …). Tracked
+separately; this PR deliberately reuses the existing
+`_enrich_undefined_error` shape rather than introducing a seventh.
+
+## 0.5.3 — 2026-06-02
+
+Document `status` coherence: leaned the lifecycle to 3 states and gave
+`archived` a real effect, after an audit found status was 100%
+descriptive (it gated nothing) and the 4th state was vestigial.
+
+### `superseded` state + `supersedes` column removed (3-state lifecycle)
+
+The 4-state model (`draft`/`active`/`archived`/`superseded`) was never
+operationalized: no code transitioned states, the `superseded` value and
+its paired `documents.supersedes` UUID FK were never read or written.
+Leaned down to **`draft` → `active` → `archived`**. `superseded` is no
+longer accepted (`akb_put`/`akb_update` return 422; both now validate the
+status enum — previously only `put` did). Migration 032 drops the unused
+`documents.supersedes` column (idempotent `DROP COLUMN IF EXISTS`).
+
+### `archived` is now hidden from default search + browse
+
+Previously `status` did not affect any read path. Now `archived` means
+something: `akb_search` and `akb_browse` (REST + MCP) **exclude archived
+documents by default**, with an opt-in `include_archived: true`. The
+default `draft` on create is unchanged — the intended flow stays
+draft → promote.
+
+Concretely: a SQL `status != 'archived'` predicate on the search
+document-candidate prefilter and the browse depth query; `include_archived`
+threaded through `SearchService.search`, `DocumentService.browse` /
+`_browse_docs`, and `DocumentRepository.list_docs_by_depth`, plus the
+`akb_search`/`akb_browse` tool schemas and REST routes. The `akb-mcp`
+proxy forwards the new param transparently (no proxy release).
+
+Verified: `superseded` rejected on put + update (422); migration 032
+drops the column on boot; browse + (embedding-backed) search hide
+archived by default and include it with `include_archived=true`;
+`test_mcp_e2e` 76/76, browse/search e2e green, status unit tests.
+
+## 0.5.2 — 2026-06-02
+
+Continuation of the v0.5.0/v0.5.1 cleanup. One more leftover surfaced
+during a post-deploy MCP probe: the `akb_help` tool schema description
+still listed `memory` and `sessions` as valid categories, and named
+`link-documents` (the pre-rename workflow) instead of `link-resources`.
+
+Tool descriptions are part of the `tools/list` MCP response that every
+agent client receives at handshake — they show up verbatim in the agent's
+own prompt. Listing dead categories there was the exact "leftover trace
+that confuses people" failure mode the v0.5.1 audit set out to avoid; it
+slipped because the audit grepped for service names + endpoints, not for
+literal references inside tool schema descriptions.
+
+Fix: rewrite the `topic` description against the actual `_HELP` keys —
+`(quickstart, documents, search, tables, files, access, history,
+publishing, relations)` for categories, `(link-resources, research,
+onboarding, data-tracking, vault-skill)` for workflows. Also dropped
+the stray `todos` entry (which was never an `_HELP` key in the first
+place; the original description had it for navigation only).
+
+No behavioural change. Verified by MCP probe against the deployed
+instance after 0.5.1: `akb_help(topic="memory")` already returned
+`No help found`; only the discovery hint was misleading.
+
+## 0.5.1 — 2026-06-02
+
+Cleanup of v0.5.0 leftovers. The agent-memory feature removal in 0.5.0
+landed cleanly on the backend but left a handful of stale references
+that would confuse anyone reading the code or the UI:
+
+- **Frontend Settings page**: the "Memory" tab still rendered and
+  called `/api/v1/memory` (404 after 0.5.0). The tab + its component
+  (`memory-tab.tsx`) + its test (`memory-tab-chips.test.tsx`) + the
+  `Memory` / `recallMemories` / `forgetMemory` / `forgetCategory`
+  exports in `lib/api.ts` are all removed; settings.tsx no longer
+  declares a `memory` `TabId`.
+- **README**: the MCP tool table still listed
+  `akb_remember/akb_recall/akb_forget` and `akb_session_start/end`. The
+  row is replaced with a short paragraph pointing at the
+  `/api/v1/agent-sessions` REST surface and the auto-provisioned memory
+  vault, so a reader sees the correct mental model on first scan.
+- **tools.py docstring** referenced `memory_id` as one of the
+  non-URI-addressable opaque handles; removed.
+- **Deprecation-note version labels** in the e2e shells + concurrency
+  unit test said "retired in v0.4.0" — these were actually retired in
+  v0.5.0 (the 0.4.x stream was license + concurrency fixes). Fixed
+  inline so anyone tracing the retirement back to a release lands on
+  the right one.
+- **`settings-tokens-setup.test.tsx`** still mocked `recallMemories` —
+  removed so the test stays accurate against the trimmed client API
+  surface.
+
+No backend runtime contract change. No new MCP tools, no schema
+change. Just trace cleanup.
+
+## 0.5.0 — 2026-06-02
+
+### Agent memory — vault-shaped, REST-only (breaking)
+
+The `akb_remember` / `akb_recall` / `akb_forget` MCP tools and the
+`memories` / `sessions` PG tables are **removed**. Agent dedicated
+memory is now expressed as a per-user vault (`agent-memory-{username}`)
+with per-session collections at `sessions/{date}/{agent_id}/{session_id}`
+and a `recap.md` document at end of session.
+
+The new surface lives at `/api/v1/agent-sessions` (Bearer auth, REST,
+**not MCP**) and is intended to be driven by lifecycle plugins
+(`akb-claude-code`, `akb-cursor`, `akb-codex`) hooked into agent
+SessionStart / PreCompact / SessionEnd / UserPromptSubmit events. The
+agent itself never calls these endpoints — they sit outside the
+tool-use loop, so the agent's tool list is unpolluted by lifecycle
+plumbing.
+
+#### Removed
+
+- MCP tools: `akb_remember`, `akb_recall`, `akb_forget`
+- Services: `app.services.memory_service`, `app.services.session_service`
+- REST routes: `/api/v1/memory*`, `/api/v1/sessions/start`, `/api/v1/sessions/{id}/end`
+- PG tables: `memories`, `sessions` (dropped by migration 031 —
+  unconditional, no FK references existed)
+- Concurrency test `INV-3` (covered the removed SessionService)
+- Help topic: `memory`, `sessions`
+- Activity / recent / diff endpoints relocated from
+  `app.api.routes.sessions` to `app.api.routes.activity` (the original
+  file was 60% session-management, 40% activity-history; once the
+  session bits left, the rename made the remaining contents honest)
+
+#### Added
+
+- `app.services.agent_memory_service.AgentMemoryService` — vault
+  auto-provisioning + session lifecycle + recall.
+- REST endpoints under `/api/v1/agent-sessions`:
+  - `POST /agent-sessions/{session_id}` — start (idempotent on
+    `session_id`; SessionStart with `source=resume|clear|compact`
+    returns the existing collection rather than 409).
+  - `POST /agent-sessions/{session_id}/end` — write `recap.md` with
+    `type: session` frontmatter; accepts the Cursor-style `reason`
+    enum (`completed | aborted | error | window_close | user_close |
+    stop`) and an independent `outcome` enum
+    (`success | partial | abandoned`).
+  - `POST /agent-sessions/{session_id}/snapshot` — durable partial
+    summary for PreCompact-class events. Each call writes a sequential
+    `snapshot-NNN.md` rather than mutating collection metadata, so
+    every snapshot is git-versioned.
+  - `GET /agent-sessions/{session_id}/context` — preferences /
+    learnings / parent-recap injection for UserPromptSubmit-class
+    hooks (synchronous by contract).
+  - `GET /agent-sessions/{session_id}` — status (`ended` flag,
+    `recap` pointer).
+  - `GET /agent-sessions` — list the caller's sessions, optional
+    `agent_id` filter.
+- Migration `031_drop_memories_sessions.py`.
+- E2E suite `backend/tests/test_agent_sessions_e2e.sh` (28 cases,
+  covers auto-provision, idempotency on resume/compact, snapshot
+  sequence, parent-recap injection across agents, ungraceful end with
+  `reason=window_close`, list/filter, validation rejects, auth).
+
+#### Convergent design — sourcing
+
+The REST contract was synthesised from a cross-harness audit of agent
+lifecycle hooks (run 2026-06-02 — see
+`product/akb/design-proposals/akb-agent-memory-rest-final-design-2026-06-02-v050.md`).
+Headline findings the API honours:
+
+- Claude Code (1.0.85+), Cursor (1.7), and OpenAI Codex CLI (April
+  2026) all expose a SessionStart hook that fires on
+  resume / clear / compact / startup with the source as a discriminator
+  field — the API is idempotent on `session_id`-in-path so the plugin
+  does not need to dedupe client-side.
+- All three agents pass at least `session_id`, `transcript_path`,
+  `cwd`, and `hook_event_name` on stdin; the start body accepts the
+  superset of these so a single plugin contract drives all three.
+- Cursor's `sessionEnd` carries an explicit `reason` enum — the API
+  adopts it verbatim plus `stop` to cover Claude Code's `Stop` hook.
+- Claude Code natively supports `{type: "http", url, headers:
+  {"Authorization": "Bearer $AKB_PAT"}, allowedEnvVars: ["AKB_PAT"]}`,
+  so the plugin can call AKB directly from the hook script with no
+  wrapper — Bearer auth on the REST endpoints is sufficient.
+
+#### Migration
+
+`memories` and `sessions` are dropped without backfill. The data was
+never user-visible outside of the `akb_remember` tool; operators who
+need to retain it must snapshot before upgrade. The recommended
+replacement workflow is to write any persistent agent state into the
+auto-provisioned memory vault through the lifecycle plugin (or
+directly via `akb_put` to the vault — it is an ordinary vault).
+
+The plugin (`packages/akb-claude-code/`) is a separate work-item; this
+release is the backend it will call.
+
+## 0.4.3 — 2026-06-02
+
+`akb_put` can now set the document `status` on create.
+
+### Optional `status` on document create
+
+`akb_put` previously hard-coded `status: draft` into both the git
+frontmatter and the `documents` row — the only way to land an `active`
+document was to follow up with `akb_update`. `DocumentPutRequest` now
+takes an optional `status` (default `"draft"`, so existing behaviour is
+unchanged) that is stamped through to the frontmatter + DB row. Pass
+`status: "active"` (or `archived`/`superseded`) to publish on create.
+
+The value is validated against the known set
+(`draft`/`active`/`archived`/`superseded`) in `DocumentService.put`
+before any git/DB work — an unknown status returns a clean 422 instead
+of silently landing a typo. Status remains **descriptive metadata** — it
+does not gate search, browse, or access; this just removes the
+put-then-update dance.
+
+The MCP `akb_put` tool schema exposes the new `status` enum; the
+`akb-mcp` proxy forwards it transparently (no proxy release needed). No
+schema change.
+
+Verified: REST + MCP round-trip (`status:"active"` → frontmatter + DB
+`active`; default → `draft`; bad value → 422); `test_mcp_e2e` 76/76,
+`test_edit_e2e` 37/37; unit tests
+`test_put_request_status_defaults_to_draft_and_accepts_active`,
+`test_put_rejects_unknown_status`.
+
+## 0.4.2 — 2026-06-02
+
+Collection-retirement vs document-PUT race: an unhandled foreign-key
+violation surfaced as HTTP 500 instead of a clean conflict.
+
+### `akb_put` into a collection being deleted returned 500
+
+When a recursive collection delete commits in the exact window between a
+concurrent PUT's `get_or_create` (which observed the collection) and that
+PUT's `INSERT INTO documents` (which still references the now-gone
+`collection_id`), the insert trips `documents_collection_id_fkey`. The
+delete side is fine — `collection_id` is `ON DELETE SET NULL`, so existing
+docs are re-homed — but a *new* insert against the vanished id is an FK
+violation that `document_repo.create` did not catch, so it bubbled up as
+an unhandled `asyncpg.ForeignKeyViolationError` → HTTP 500.
+
+`create` already maps a `UniqueViolationError` (duplicate path) to a 409;
+it now maps a `ForeignKeyViolationError` the same way, with a clear
+"Target collection or vault was concurrently deleted" message. The racing
+writer gets a clean, retryable 409 instead of a 500. No schema change.
+
+Found via an external "E06 collection retirement race" report (40 PUTs
+racing a recursive collection delete). Note: the report's primary symptom
+— all 40 PUTs as transport-level "status 0" — was the 0.4.1 pool-deadlock
+(the deployment under test had regressed to 0.4.0); with the pool fix in
+place the deadlock is gone and only this residual FK 500 remained.
+
+Verified: E06 repro (40 PUTs, seeded to widen the race window) returned
+`{200, 500}` before and `{200, 409}` after (5xx → 0); `test_mcp_e2e`
+76/76, `test_collection_lifecycle_e2e` 36/36; deterministic unit test
+(`test_create_with_deleted_collection_raises_conflict`). Repro harness:
+`backend/tests/concurrency/repro_e05_e06_delete_race.py`.
+
 ## 0.4.1 — 2026-06-02
 
 Connection-pool deadlock on the document write paths under a concurrent

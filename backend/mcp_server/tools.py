@@ -28,8 +28,8 @@ The pair tools (`akb_link`, `akb_unlink`) take `source` + `target`
 URIs — they too do not need a separate `vault` arg.
 
 Opaque domain handles that are *not* vault resources keep their own
-ID parameter (`session_id`, `todo_id`, `memory_id`, publication
-`slug`); these are not URI-addressable.
+ID parameter (`todo_id`, publication `slug`); these are not
+URI-addressable.
 """
 
 from mcp.types import Tool
@@ -55,7 +55,6 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "filter": {"type": "string", "description": "Substring filter against name+description (case-insensitive)."},
-                "query": {"type": "string", "description": "DEPRECATED alias for `filter`. Use `filter` in new code."},
                 "limit": {"type": "integer", "description": "Cap result count."},
                 "offset": {"type": "integer", "description": "Skip first N (default 0)."},
                 "include_archived": {"type": "boolean", "description": "Include archived vaults (default false)."},
@@ -131,6 +130,16 @@ TOOLS = [
                     "enum": ["note", "report", "decision", "spec", "plan", "session", "task", "reference", "skill"],
                     "default": "note",
                 },
+                "status": {
+                    "type": "string",
+                    "description": (
+                        "Lifecycle status. Defaults to 'draft'; pass 'active' to publish on "
+                        "create instead of promoting later with akb_update. Descriptive "
+                        "metadata only — it does not gate search, browse, or access."
+                    ),
+                    "enum": ["draft", "active", "archived"],
+                    "default": "draft",
+                },
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags for classification"},
                 "domain": {"type": "string", "description": "Domain: engineering, product, ops, legal, etc."},
                 "summary": {"type": "string", "description": "Brief summary (auto-generated if omitted)"},
@@ -167,7 +176,7 @@ TOOLS = [
                 "uri": {"type": "string", "description": "Document URI"},
                 "content": {"type": "string", "description": "New document body (replaces existing)"},
                 "title": {"type": "string", "description": "New title"},
-                "status": {"type": "string", "enum": ["draft", "active", "archived", "superseded"]},
+                "status": {"type": "string", "enum": ["draft", "active", "archived"]},
                 "tags": {"type": "array", "items": {"type": "string"}},
                 "summary": {"type": "string"},
                 "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Update dependency list (akb:// URIs)"},
@@ -287,7 +296,6 @@ TOOLS = [
                     "description": "Filter by content type",
                 },
                 "filter": {"type": "string", "description": "Substring filter on item name/path (case-insensitive)."},
-                "query": {"type": "string", "description": "DEPRECATED alias for `filter`. Use `filter` in new code."},
                 "limit": {"type": "integer", "description": "Cap returned item count."},
                 "offset": {"type": "integer", "description": "Skip first N items (default 0)."},
                 "include_summary": {"type": "boolean", "description": "Include the per-item summary field (default false, drops to keep payload small)."},
@@ -297,6 +305,11 @@ TOOLS = [
                         "Include AKB-certified content_hash/hash_algorithm and "
                         "resource version fields for documents/files."
                     ),
+                },
+                "include_archived": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Include archived documents. Default false — `status: archived` docs are hidden from browse.",
                 },
             },
             # Either `vault` or `uri` must be present — enforced at the
@@ -331,6 +344,11 @@ TOOLS = [
                 },
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "Filter by tags"},
                 "limit": {"type": "integer", "default": 10, "minimum": 1, "maximum": 50},
+                "include_archived": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Include archived documents. Default false — `status: archived` docs are hidden from search.",
+                },
             },
             "required": ["query"],
         },
@@ -639,115 +657,53 @@ TOOLS = [
         },
     ),
     Tool(
-        name="akb_remember",
-        description=(
-            "Store something in your persistent memory. "
-            "Memories persist across sessions — use this to remember important context, "
-            "decisions, preferences, or learnings for future sessions. "
-            "Categories: context (current work), preference (how you like to work), "
-            "learning (things you learned), work (completed work), general."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "content": {"type": "string", "description": "What to remember"},
-                "category": {
-                    "type": "string",
-                    "description": "Memory category",
-                    "enum": ["context", "preference", "learning", "work", "general"],
-                    "default": "general",
-                },
-            },
-            "required": ["content"],
-        },
-    ),
-    Tool(
-        name="akb_recall",
-        description=(
-            "Retrieve your persistent memories from previous sessions. "
-            "Call this at the start of a session to recall what you were working on. "
-            "Filter by category for specific types of memory."
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "category": {
-                    "type": "string",
-                    "description": "Filter by category (omit for all)",
-                    "enum": ["context", "preference", "learning", "work", "general"],
-                },
-                "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 50},
-            },
-        },
-    ),
-    Tool(
-        name="akb_forget",
-        description="Delete a specific memory by its ID.",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "memory_id": {"type": "string", "description": "Memory ID to delete"},
-            },
-            "required": ["memory_id"],
-        },
-    ),
-    Tool(
         name="akb_publish",
         description=(
-            "Create a public share URL for a document, table query, or file. "
-            "For a document or file, pass the resource `uri`. For a table query, "
-            "pass the SQL plus `vault` (queries can span multiple vaults — list them "
-            "in query_vault_names). "
-            "Supports expiration, password protection, view count limits, snapshots, and section filtering. "
-            "Returns a shareable URL accessible without authentication. "
-            "Prefer `public_url_full` (absolute URL) when sharing the link with a user; "
-            "fall back to `public_url` (relative path) only if `public_url_full` is null."
+            "Create a public, no-auth share URL for a document, file, or table query. "
+            "Document/file: pass the resource `uri`. Table query: pass `query_sql` "
+            "plus `vault` (and `query_vault_names` if the query touches more than one). "
+            "Returns the canonical publication dict — `slug` is the only identifier "
+            "you need; `share_url` is always an absolute URL ready to paste."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "uri": {"type": "string", "description": "Resource URI to publish (document or file). Omit for table_query."},
+                "uri": {"type": "string", "description": "Resource URI to publish — required when resource_type is document or file. Omit for table_query."},
                 "resource_type": {
                     "type": "string",
                     "enum": ["document", "table_query", "file"],
                     "default": "document",
-                    "description": "Type of resource to share. For document/file, also pass uri. For table_query, pass query_sql + vault.",
+                    "description": "Kind of resource. document/file → pass `uri`. table_query → pass `query_sql` + `vault`.",
                 },
-                "vault": {"type": "string", "description": "Vault name (required for resource_type=table_query)"},
+                "vault": {"type": "string", "description": "Vault name. Required only for resource_type=table_query (doc/file vault is inferred from the URI)."},
                 "query_sql": {
                     "type": "string",
-                    "description": "SELECT SQL with :param placeholders (for resource_type=table_query)",
+                    "description": "SELECT/WITH SQL with :param placeholders. resource_type=table_query only.",
                 },
                 "query_vault_names": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Vaults referenced by the query (defaults to [vault])",
+                    "description": "Vaults the query reads from. Defaults to [vault]. resource_type=table_query only.",
                 },
                 "query_params": {
                     "type": "object",
-                    "description": "Parameter declarations: {name: {type, default, required}}",
+                    "description": "Parameter declarations: {name: {type, default, required}}. resource_type=table_query only.",
                 },
-                "password": {"type": "string", "description": "Password to protect the share"},
-                "max_views": {"type": "integer", "description": "Auto-expire after N views"},
+                "password": {"type": "string", "description": "Require this password to view the share."},
+                "max_views": {"type": "integer", "description": "Auto-expire after N views."},
                 "expires_in": {
                     "type": "string",
-                    "description": "Expiration: '1h', '7d', '30d', or 'never' (default)",
+                    "description": "Expiration window: '1h', '7d', '30d', or 'never' (default).",
                 },
-                "title": {"type": "string", "description": "Override display title"},
-                "mode": {
+                "title": {"type": "string", "description": "Override the display title (defaults to the resource's own title)."},
+                "section_filter": {
                     "type": "string",
-                    "enum": ["live", "snapshot"],
-                    "default": "live",
-                    "description": "live=query each request, snapshot=cache result in S3",
-                },
-                "section": {
-                    "type": "string",
-                    "description": "(document) Filter to a specific heading section",
+                    "description": "Filter to a specific heading section. resource_type=document only.",
                 },
                 "allow_embed": {
                     "type": "boolean",
                     "default": True,
-                    "description": "Whether the share can be embedded via iframe/oEmbed",
+                    "description": "Allow the share to be embedded via iframe/oEmbed.",
                 },
             },
         },
@@ -755,20 +711,25 @@ TOOLS = [
     Tool(
         name="akb_unpublish",
         description=(
-            "Remove a public share. Pass `slug` to delete a single publication, "
-            "or `uri` to delete all publications for that resource."
+            "Remove publication(s). Pass `slug` to remove one specific publication, "
+            "OR `uri` to remove every publication of that document/file resource "
+            "(handy when re-publishing). table_query publications have no resource "
+            "URI, so remove them by slug. Returns {deleted: N}."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "uri": {"type": "string", "description": "Resource URI — deletes all publications for this resource"},
-                "slug": {"type": "string", "description": "Publication slug — deletes that specific publication"},
+                "slug": {"type": "string", "description": "Publication slug — remove exactly this publication."},
+                "uri": {"type": "string", "description": "Document or file URI — remove every publication tied to that resource."},
             },
         },
     ),
     Tool(
         name="akb_publications",
-        description="List all publications in a vault (documents, table queries, files).",
+        description=(
+            "List every publication in a vault. Each item is the canonical "
+            "publication dict (same shape as `akb_publish` returns)."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
@@ -784,14 +745,18 @@ TOOLS = [
     ),
     Tool(
         name="akb_publication_snapshot",
-        description="Create a snapshot of a table_query publication. Saves the current query result to S3 and switches mode to 'snapshot'.",
+        description=(
+            "Freeze a table_query publication's current result to S3 and flip its "
+            "mode to 'snapshot' (subsequent visits return the cached result). "
+            "Identified by `slug` alone — the vault is resolved from the publication. "
+            "Returns the updated publication dict."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
-                "vault": {"type": "string", "description": "Vault name"},
                 "slug": {"type": "string", "description": "Publication slug"},
             },
-            "required": ["vault", "slug"],
+            "required": ["slug"],
         },
     ),
     Tool(
@@ -980,9 +945,9 @@ TOOLS = [
                     "type": "string",
                     "description": (
                         "What to get help on. Options: "
-                        "categories (quickstart, documents, search, tables, access, memory, sessions, publishing), "
+                        "categories (quickstart, documents, search, tables, files, access, history, publishing, relations), "
                         "tool names (akb_put, akb_search, etc.), "
-                        "or workflow names (link-documents, research, onboarding, data-tracking)"
+                        "or workflow names (link-resources, research, onboarding, data-tracking, vault-skill)"
                     ),
                 },
                 "vault": {
