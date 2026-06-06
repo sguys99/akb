@@ -5,6 +5,621 @@ the `akb-mcp` stdio proxy. This changelog tracks the backend
 specifically; the proxy has its own log in
 `packages/akb-mcp-client/CHANGELOG.md` and a separate version stream.
 
+## 0.8.1 — 2026-06-06  *(patch — compliance-grade audit log, producer-only, off by default)*
+
+AKB now emits a structured, append-only, hash-chained **audit log** and
+(optionally) hands the daily rolled file off to a WORM object-storage
+bucket. AKB is a *producer*: it does not store, query, or retain audit
+data. Off by default; enable with the new `audit:` config section.
+
+### Why producer-only (the design, recorded here deliberately)
+
+AKB is delivered to customer sites. In that setting the customer's
+security org already runs a SIEM (Splunk / QRadar / ArcSight / Elastic /
+Chronicle) and owns retention, WORM, query, and correlation under *its
+own* compliance regime. The dominant and correct pattern for delivered
+software is **"produce, don't own"**: the vendor emits a faithful,
+complete, tamper-evident audit stream in a standard place/format and the
+customer's audit system scrapes it. An AKB-side audit store/query/
+retention tier would be redundant infrastructure the customer doesn't
+want (it fragments their single pane of glass) and would wrongly impose
+our retention policy over theirs.
+
+What a producer still owns — because the customer cannot retrofit it:
+
+- **Completeness** — no lost events, no events for actions that didn't
+  happen. Captured at the source.
+- **A durable handoff buffer** so a collector/bucket outage doesn't lose
+  events.
+- **A standard format** the SIEM can parse.
+- **Tamper-evidence at the source** so the customer can *prove* to its
+  auditor that what it scraped is complete and unaltered.
+
+### Alternatives considered and rejected
+
+- **Transactional outbox (in-tx with the domain write).** The existing
+  `events` outbox binds an event to the PG transaction. But an AKB write
+  already spans PG + git + vector store + S3 and is *not* globally
+  atomic — PG is the authority and the rest reconcile around it. A strict
+  in-tx audit outbox would hold the audit line to a *stronger* consistency
+  standard than the domain operation itself has, for the sake of one rare
+  edge (commit-then-crash-before-log). Not worth the machinery, so the
+  model is uniform **best-effort post-operation append** for reads and
+  writes alike.
+- **Kafka backbone / Debezium → Kafka.** A good *transport* upgrade for
+  multi-sink fanout, but it's a bus, not a system of record: it solves
+  neither atomicity (front) nor immutability (back), and mandating a Kafka
+  cluster raises the floor for self-host OSS users. Left as a possible
+  future sink driver, not a dependency.
+- **A separate audit PG instance.** Only meaningful if AKB owned the
+  query/system-of-record tier — which the producer model gives to the
+  customer's SIEM. A second PG that isn't in the domain transaction buys
+  nothing over a file in terms of atomicity, so it's dropped.
+- **A vendor-side 3-tier WORM/query stack.** Same reason — that's the
+  customer's job.
+
+The capture point is the **Kubernetes audit-backend pattern**: log at the
+API layer (the MCP `_dispatch` chokepoint), not per-service, so one
+instrumentation point covers every read and write uniformly. Per-action
+verbosity follows K8s "levels" — reads are logged at *Metadata* level
+(who/verb/target, no bodies) and can be turned off (`audit.log_reads`);
+state-changing calls are always logged.
+
+### What ships
+
+- `backend/app/services/audit_log.py` — the producer. `record()` /
+  `record_tool()` (best-effort, never raise into the caller),
+  `verify_chain()` (operators/SIEM prove integrity), and a background
+  uploader.
+  - **Hash chain + per-file seq.** Each line carries a monotonic `seq` and
+    `h = sha256(prev_h ‖ canonical(line))`; a dropped/altered/re-ordered
+    line breaks the chain. The chain re-seeds from the on-disk file on
+    restart so it survives a pod bounce.
+  - **Manifest on handoff.** Each uploaded day object gets a sibling
+    `*.manifest.json` (line count, first/last seq, file digest, chain
+    head) so completeness and integrity are checkable from the bucket
+    alone.
+  - **Local file lifecycle.** Day 0 append → day ≥1 upload to bucket →
+    day ≥`local_retention_days` (default 2) prune the local copy, **but
+    only after a confirmed upload**. A bucket outage accumulates files
+    locally and warns; it never deletes un-uploaded audit.
+- `backend/app/config.py` — new nested `audit:` section (`AuditSettings`):
+  `enabled`, `log_dir`, `log_reads`, `bucket`, dedicated S3 credentials
+  (`endpoint_url` / `access_key` / `secret_key` / `region`),
+  `upload_interval_secs`, `local_retention_days`. Nested (not flat
+  `audit_*`) so the surface can grow — redaction, per-action levels,
+  signing keys, syslog/webhook sinks — without littering the top level.
+- **Credential isolation.** The handoff uses a *dedicated* audit-storage
+  credential when set, falling back to the system S3 connection only for
+  convenience. The recommended posture is a **write-only** key
+  (PutObject, no Delete) on a separate Object-Lock account: AKB never
+  deletes bucket objects (only the local buffer is pruned), so a
+  compromise of the app's primary S3 key cannot rewrite or erase the
+  trail. boto3 client construction is centralised in
+  `s3_adapter.make_client()` so the file store and the audit store build
+  clients identically.
+- `backend/mcp_server/server.py` — `call_tool` resolves the actor once,
+  passes it to `_dispatch`, and audits both the success and the
+  last-resort error envelope. `_get_user` audits `auth.denied` when a
+  presented credential is rejected (no token material recorded).
+- `backend/app/services/lifecycle.py` — `audit_log.init()` seeds the
+  chain at startup; the uploader starts only when `audit.bucket` is set
+  (file-only mode still writes the stream for a co-located shipper to
+  tail). Stopped in `stop_workers`.
+- `backend/app/main.py` — `/health` gains an `audit` block (enabled, dir,
+  today's file, seq, bucket, pending-upload count).
+- `backend/tests/test_audit_log.py` — unit tests: append + schema, seq
+  monotonicity, hash-chain verify + tamper detection, restart re-seed,
+  read-skip when `log_reads=false`, write-always-logged, never-raises on
+  an unwritable dir, and the upload/prune lifecycle (with a fake S3).
+- `config/app.yaml.example` — documented (commented) `audit:` section.
+
+### Not yet covered (follow-ups)
+
+- REST `/auth/login` success/failure is not yet audited — auth events that
+  flow through MCP tools are captured at dispatch, but the REST login
+  route is a separate entry point. Tracked for a later pass.
+- Sink drivers beyond `file` + S3 handoff (syslog/CEF, webhook, OTLP) are
+  designed for but not implemented; the `audit:` section is shaped to
+  grow into them.
+
+## 0.8.0 — 2026-06-06  *(minor — `seahorse-db-grpc` driver, opt-in gRPC sibling of `seahorse-db`)*
+
+A second SeahorseDB driver that talks gRPC to the same Coral coordinator (port and config are shared with `seahorse-db`; only the wire format differs). Opt-in via `vector_store_driver: seahorse-db-grpc`. The REST `seahorse-db` driver remains the documented production path; the gRPC variant is shipped as `experimental` until it clears its own QPS / recall benchmark.
+
+### Why
+
+0.7.7's release notes called out two real bugs we caught only because the wire happened to be JSON — i64 overflow on the PK column (`arrow_json::Decoder` rejects unsigned > 2^63 - 1 with a generic 500) and double-IDF/double-saturation on BM25 sparse weights. Both were client bugs, but the i64 surface is a JSON-parsing artifact. Typed gRPC (protobuf int64 for the PK, Arrow IPC for streamed search results, explicit message types for the dense and sparse legs) makes the type contract obvious at the wire boundary instead of letting "any uint64 value" reach Coral as untyped JSON. The intent is not to retire the REST driver — it works — but to give operators a transport with stricter typing on the same backend.
+
+### What ships
+
+- `backend/app/services/vector_store/seahorse_db_grpc.py` — new driver, ~470 lines.
+- `backend/app/services/vector_store/_seahorse_common.py` — `chunk_id_to_label`, `encode_sparse_string`, `validate_uuid_for_sql`. Shared by both `seahorse_db.py` (REST) and `seahorse_db_grpc.py` (gRPC); the REST driver re-exports them under their old underscore names for backwards compatibility within this package.
+- `backend/tests/test_seahorse_db_grpc_unit.py` — 31 mock-based unit tests covering protobuf wire shapes for every Protocol method, Arrow IPC decode round-trip, SQL-injection guards on `delete_point` and `hybrid_search`'s `source_id` filter, and CRUD parity with the REST driver.
+- `backend/tests/test_sparse_weight_convention.py` — cross-driver regression. Parametrised over every value in `vector_store_driver`'s Literal; fails if the encoder's `_use_raw_weights()` flag doesn't match a deliberately-declared `_EXPECTED` table. Caught the gRPC driver's silent inheritance of 0.7.7's bug before merge.
+  - Five Protocol methods:
+    - `health` → `HealthService.Check`
+    - `ensure_collection` → `TableService.GetTable` + `CreateTable` (typed `CreateTableSpec`; no Arrow IPC schema bytes needed)
+    - `upsert_one` → `IngestService.InsertJsonl` (same JSONL bytes the REST driver ships — keeps the 0.7.7 signed-i64 label fix and the raw-mode BM25 fix shared at the encoder level)
+    - `delete_point` → `IngestService.DeleteTableData`
+    - `hybrid_search` → `QueryService.HybridSearch` (server streaming; chunks are Arrow IPC stream bytes decoded with pyarrow)
+  - Sparse + label helpers (`_chunk_id_to_label`, `_encode_sparse_string`, `_validate_uuid_for_sql`) are imported from `seahorse_db.py` so encoder bugs fixed in one place don't drift between drivers.
+- `backend/app/services/vector_store/_grpc/proto/coral/**` — vendored Coral `.proto` files and `grpc_tools.protoc`-generated stubs. Source pinned at SeahorseDB monorepo commit `e1364f27` (`SDDEV-244/monorepo-coral-sparse`). Regeneration procedure documented in `_grpc/README.md`.
+- `backend/app/services/vector_store/factory.py` — new `elif driver == "seahorse-db-grpc":` branch that reuses the existing `seahorsedb_*` settings (same Coral, same port, same auto-create flag).
+- `backend/app/config.py` — `vector_store_driver` Literal extended with `"seahorse-db-grpc"`.
+- `backend/pyproject.toml` — three new runtime deps:
+  - `grpcio==1.81.0` (the floor `grpc_tools.protoc` 1.81 emits in generated `_pb2_grpc` files)
+  - `protobuf==6.33.6` (inside grpcio 1.81's `>=6.33.5,<7.0.0` range)
+  - `pyarrow==22.0.0` (decode `ResultStreamChunk` Arrow IPC bytes)
+
+### Wire details worth remembering
+
+(All discovered during local validation; recorded here so the next reader doesn't have to rediscover them.)
+
+- `CreateTableRequest.table` is `CreateTableSpec`, **not** `TableInfo` — so the schema can be described column-by-column in proto-native form and an Arrow IPC schema-bytes payload is not required.
+- `DenseVectorSearchConfig.vectors` is `repeated FloatVector` (not wrapped in `DenseQueryVectors`); `SparseVectorSearchConfig.vectors` is `repeated string`. The wrapper messages exist in the proto but only inside `VectorQuery`, not inside the SearchConfig path.
+- `FusionConfig.parameters` carries the RRF `k`. The REST driver pins `k=60`; the gRPC driver does the same via `FusionParameters(k=60)`. Leaving it as the server default silently shifts fused ordering vs the REST stream.
+- BM25 `SparseSearchParameters` and `SparseMetadata` are sent together. Coral returns `INVALID_ARGUMENT "BM25 parameters (k/b) require N, avgdl, and df metadata"` if you send parameters without metadata. The driver mirrors the REST driver's "send metadata only when stats + query tokens exist" gate, which is an asymmetry that affects both drivers when the corpus stats haven't loaded — flagged as follow-up.
+
+### Verification
+
+- Local Coral (port 53286) — each Protocol method individually exercised; round-trip with create / health / upsert (one row, then five rows) / hybrid search returning Arrow-decoded hits / delete.
+- `test_hybrid_search_e2e.sh` — full 25 scenarios against a backend whose `vector_store_driver` was flipped to `seahorse-db-grpc`. Pass: 25 / Fail: 0. Same result the REST driver gets on the same harness.
+- `bash scripts/check.sh` — green. The generated stubs are excluded from ruff via `pyproject.toml`'s `extend-exclude` since they're vendored, not hand-written.
+
+### Caveats
+
+- **Experimental**: not yet a recommended production driver. Use `seahorse-db` (REST) unless you have a measurement that says otherwise. QPS / recall benchmark against the REST driver is queued as the next follow-up.
+- **CI does not exercise the gRPC path** — no live Coral in CI. The driver's import-time correctness and the unit tests under `backend/tests/test_seahorse_db_grpc_unit.py` (also in this release) are what CI catches; end-to-end behaviour relies on the local 25-scenario run an operator does before flipping the production config.
+- **BM25 metadata asymmetry** (pre-existing, also in REST): both drivers send `parameters` whenever a search runs, but `metadata` only when `bm25_stats` has populated values. On a fresh corpus where `total_docs == 0` Coral will reject the hybrid search until the stats catch up. Filed as a follow-up to fix in both drivers.
+- **Three new runtime deps** raise the wheel size for everyone, not just gRPC users. We considered an optional dep group (`pip install akb[seahorse-grpc]`) and decided against it: AKB ships and is run as a container image, and ~50 MB inside Docker is not a meaningful constraint. The "extra failure mode if deps are missing" argument we initially gave for landing them as required is weaker — a `try: import grpc` in the factory branch would handle that in three lines. Revisit if a non-container distribution emerges; until then the call is "we don't gate wheel size for non-container users", said out loud.
+
+### Mid-merge design review — what it caught
+
+Before merging, an independent reviewer walked the week's changes (0.5.x → 0.8.0 working tree) and flagged two real issues that this section now reflects.
+
+**Blocker — the gRPC driver inherited 0.7.7's bug.** `sparse_encoder._use_raw_weights()` was a literal equality check against the string `"seahorse-db"`; the new `"seahorse-db-grpc"` driver fell through to the pre-baked branch (saturated TF × IDF), which is exactly the double-IDF/double-saturation shape 0.7.7 fixed for the REST driver. The 25-scenario hybrid e2e still passed because RRF fusion with a healthy dense leg masks BM25 weight drift unless the test set is specifically engineered to surface it (ours isn't, yet). Fixed by switching the gate to a frozenset (`_RAW_WEIGHT_DRIVERS = {"seahorse-db", "seahorse-db-grpc"}`), and added `backend/tests/test_sparse_weight_convention.py` — a `typing.get_args`-driven regression that fails the moment the `vector_store_driver` Literal grows a value not declared in the test's `_EXPECTED` convention table. Next time a Coral-family transport lands, the contributor either declares its BM25 convention out loud or the test goes red on PR.
+
+**Hygiene — load-bearing cross-file private import.** The gRPC driver was reaching into `seahorse_db.py` for `_chunk_id_to_label`, `_encode_sparse_string`, and `_validate_uuid_for_sql`. Pragmatic, but it made the REST driver both "a driver" and "the home of shared helpers", which is the separation-of-concerns violation 0.7.0's seahorse-cloud / seahorse-db split was supposed to enforce. Promoted the three helpers to `backend/app/services/vector_store/_seahorse_common.py`; both drivers now import them from the same first-class module. No behaviour change, but the contract is now public-to-this-package instead of "please don't break me".
+
+**Acknowledged but deferred** (filed as follow-ups, not blockers for this release):
+
+- The `_use_raw_weights()` frozenset is still the wrong shape architecturally; the cleaner fix is to put `sparse_weight_convention` on the driver class (or the Protocol) and have the encoder ask the driver, not the settings. Doing it now would change every driver implementation; doing it next release lets us measure the gRPC variant first.
+- `seahorse-db-grpc` could have been a `seahorsedb_transport: rest|grpc` flag on a single `seahorse-db` enum value instead of a separate enum entry; that would have moved the choice off the driver-factory axis. Worth considering before a third Coral transport (Arrow IPC streaming ingest, eventually).
+- 0.7.0's split was completed at the wrong altitude — sparse weight ownership ended up on the wrong side of the seam. 0.7.7 plumbed driver-awareness *backwards* into `sparse_encoder` to compensate, and 0.8.0 now leans on that workaround. The next time we touch this area, the goal should be to move BM25 convention ownership onto the driver and stop the encoder from reading config.
+
+### Not deployed
+
+prod + demo are unchanged (pgvector). The dogfood stack we built to evaluate `seahorse-db-grpc` lives outside this repo (gitignored internal manifests); details in `deploy/k8s/internal/seahorse-db/README.md` and the AKB product vault `seahorsedb-rust-on-prem-dogfood-k8s-deployment-reference.md`.
+
+---
+
+## 0.7.9 — 2026-06-05  *(patch — `scripts/migrate_pgvector_to_seahorsedb.py`: bulk migrate without re-embedding)*
+
+The default driver-switch path (flip `vector_store_driver`, restart, let `embed_worker` rebuild) re-calls the embedding API for every chunk. On a production-sized vault that's real OpenRouter cost and real wall-clock time. The dense vectors are already sitting in pgvector's `vector_index.chunks` table, so we don't have to.
+
+`backend/scripts/migrate_pgvector_to_seahorsedb.py` reads the existing dense vectors directly out of pgvector and ships them to a fresh seahorse-db table over the driver's normal `upsert_one` path:
+
+- **Embedding API calls: 0.** Dense vectors are deterministic in `(content, model)` per `init.sql:135-138`; bulk-copy doesn't change them.
+- **Sparse is re-encoded from `chunks.content`.** The pgvector path stores pre-saturated TF weights for its posting table; the seahorse-db path needs raw TF + query weight 1.0 (see 0.7.7 CHANGELOG and `sparse_encoder` module docstring). Re-running `encode_document` with `settings.vector_store_driver = "seahorse-db"` produces the correct convention.
+- **Idempotent.** Re-running against a partially-migrated table is safe; `upsert_one` is idempotent on `(table_name, id)`.
+
+### Local verification
+
+65-chunk vault: 65/65 succeeded, 0 failed, 2.7s wall clock (~24 chunks/sec), **0 embed API calls**. Coral's `/indexes/indexed-row-count` reports 65 dense and 65 sparse after Kafka catches up (~10s). Default reindex on the same chunks would take ~30-60s of wall clock + the OpenRouter charge.
+
+### Caveats documented inline
+
+- Operator must flip `vector_store_driver` in `app.yaml` to `seahorse-db` BEFORE running the script — otherwise `sparse_encoder` emits pgvector-shape weights and the migration ships incorrect sparse data. The script refuses to run with a mismatched driver setting.
+- Embedding-disabled rows (`dense IS NULL` in pgvector) are skipped with a warning — seahorse-db's schema rejects nullable vector columns (0.7.6 CHANGELOG).
+- The script does NOT delete from pgvector. After a clean migration the operator can drop the `vector_index` schema manually; source rows are left untouched for rollback.
+
+### Driver-side fix while we were here
+
+`SeahorseDbStore.upsert_one` received a `numpy.float32`-typed dense array on the migration path (asyncpg's pgvector codec yields numpy arrays). `json.dumps` doesn't know how to serialise those. The migration script casts to Python `float` at the boundary; cleaner there than plumbing numpy awareness into the driver.
+
+### Files
+
+- `backend/scripts/migrate_pgvector_to_seahorsedb.py` — new
+
+### Not deployed
+
+prod + demo unchanged (pgvector). Running this script against production is now an option an operator can reach for during a future seahorse-db evaluation — it is not yet a recommended operation.
+
+---
+
+## 0.7.7 — 2026-06-05  *(patch — `seahorse-db` two real bugs in our own driver, not Coral: unsigned i64 PK label + double-BM25 sparse weights)*
+
+The Coral `error_code 500233` we filed as [SeahorseDB#433](https://github.com/dn-inc/SeahorseDB/issues/433) and the 4 retrieval-side failures from 0.7.3 (`dense`, `bm25-en`, `bm25-ko`, `isolation-B`) both turned out to be bugs in **this driver**, not in SeahorseDB. Reading Coral's source code with the actual log lines in hand isolated both in about an hour.
+
+### Real cause #1 — unsigned i64 PK label
+
+`_chunk_id_to_label` hashed the UUID's first 8 bytes as **unsigned**:
+
+```python
+return int.from_bytes(raw[:8], "big", signed=False)
+```
+
+Coral's JSONL ingest path parses INT64 columns through `arrow_json::Decoder`. Arrow's INT64 is signed; values > 2^63 - 1 fail the JSON-to-RecordBatch conversion with a generic `ComponentError::Arrow(_)` → HTTP 500 `error_code 500233 "Internal error"` (no row context, because the parser errors before the body is even traversed).
+
+Random UUIDs have a high bit set in their first 8 bytes about 50% of the time. The "sustained insert load 4-7% reject rate" we observed in 0.7.3 was a sampling artifact — the **actual** rejection rate for in-flight batches was much higher; the worker just retries each chunk up to 8 times before abandoning, so most rows eventually landed once retried with the bit unset, and only the worst-luck ~5% remained unindexed past the e2e budget.
+
+Direct check on the live PG vault that was reproducing the failure:
+
+```
+chunk_id                              label                  fits_in_i64
+7471f432-c50f-47e5-9bff-7b169c24e3ec   8390756079659599845   OK
+3e781cd3-49c4-4aa2-9973-f80492ba116c   4501379521358088866   OK
+565c66b6-959c-4779-b09c-2205fa5c185c   6222961719499310969   OK
+cf5c4205-7f7b-48ae-ab49-2fe10a5bd1f3   14941890255089518766  OVERFLOW
+eb486b7b-c81c-4ebd-b74a-17998e6daa03   16953918976618679997  OVERFLOW
+```
+
+40% overflow on a sample of 5 — perfectly consistent with the ~50% prior.
+
+**Fix**: `signed=True`. One character. The label space is still the full 64 bits; signedness has no effect on collision probability. The docstring now explains the constraint and points back to SeahorseDB#433 so the next reader doesn't reinvent the bug.
+
+**Reported back upstream**: SeahorseDB#433's "no row context on 500233" surface complaint is mostly cosmetic now — the error type was always Arrow, but the response body's `"Internal error"` makes it hard to find. Upstream may want to enrich the error context, but the driver-side fix removes the user-facing symptom entirely.
+
+### Real cause #2 — double-BM25 sparse weight encoding
+
+`sparse_encoder` ships AKB's BM25 in a **pre-baked dot-product form** specifically tuned for pgvector's posting table: doc weight = saturated TF, query weight = IDF, dot = BM25 score. Dropping that into Coral's inverted index — which **also** applies BM25 saturation + computes IDF from the metadata we pass at search time — produces:
+
+- Doc side: `BM25_saturate(saturated_TF)` → over-saturated TF, downstream relevance collapses for high-TF terms
+- Query side: `IDF × IDF = IDF²` → over-weights rare terms, under-weights medium-rare ones
+
+That's the 0.7.3 narrative's "4 retrieval failures unexplained by `vector_indexed_at` numbers" answered. The chunks were indexed; the rankings were just structurally wrong.
+
+`seahorse-index/src/sparse/scoring.rs:13-37` shows Coral's exact BM25 component formula. `seahorse-index/src/sparse/parser.rs:158-176` confirms doc-side weight is the raw `term_frequency` parameter, expecting raw TF. No vocab management on the SeahorseDB side — caller (us) owns vocab + emits `(term_id, raw_tf)` per doc and `(term_id, 1.0)` per query term with per-term `df` in the query metadata.
+
+**Fix**: `sparse_encoder` now branches on `settings.vector_store_driver`:
+
+- `pgvector`, `qdrant`, `seahorse-cloud` → unchanged pre-baked encoding (saturated TF + IDF). Their stores either don't compute BM25 (pgvector/qdrant) or don't care (cloud).
+- `seahorse-db` → new raw branch. Doc weight = raw TF, query weight = 1.0. Coral applies the BM25 math at search time from the (k, b, N, avgdl, df) we already ship.
+
+Module docstring carries the convention table. `_use_raw_weights()` is the single source of truth — adding a future driver means picking which of the two columns it lives in.
+
+### Reverses 0.7.6's "structurally unsupported" claim partially
+
+0.7.6 closed BM25-only fallback as structurally impossible because of Coral's NOT NULL on vector columns. That part stays — `dense=None` ingest is still rejected. But the four hybrid-search failures it was lumped in with were unrelated to the NULL constraint; they were the two driver bugs above. 0.7.6 narrative now reads as overclaim — we attributed driver bugs to the catalog. Not retracting 0.7.6 in a follow-up version because 0.7.6's NOT NULL finding is still accurate; just noting here that the "4 e2e fails are recall-side" reasoning in 0.7.3 was wrong about *why* and the "BM25-only is the cause" reasoning in 0.7.6 was wrong about *which fails*.
+
+### Verification
+
+- `_chunk_id_to_label`: confirmed `signed=True` makes the same UUIDs that previously generated overflow labels fit in i64; backend log under `seahorse-db` mode now reads 0 × 500 across all POST /data calls (was previously 100% on a fresh table).
+- `sparse_encoder._use_raw_weights()`: returns True only when `settings.vector_store_driver == "seahorse-db"`.
+- Fresh local validation: 1 vault, 1 Kubernetes doc with mixed Korean/English content, raw-mode ingest:
+  - `q=쿠버네티스` → Kubernetes Guide #1 (correct)
+  - `q=Korean tokenization` → hello.md #1 (correct)
+- 25-scenario `test_hybrid_search_e2e.sh` against the same Coral with both fixes active: **pending in background at release prep time; expected to clear the 4 prior failures.** Will append the result to this CHANGELOG entry on PR merge.
+
+### Files
+
+- `backend/app/services/vector_store/seahorse_db.py` — `_chunk_id_to_label` unsigned → signed, docstring expanded with the Arrow overflow explanation
+- `backend/app/services/sparse_encoder.py` — new `_use_raw_weights()` selector; `encode_document` and `encode_query` each branch on it; module docstring carries the convention table
+
+### prod / demo
+
+Unchanged. Both still pgvector and unaffected by the seahorse-db driver work in this release.
+
+---
+
+## 0.7.6 — 2026-06-05  *(patch — `seahorse-db` BM25-only fallback documented as structurally unsupported)*
+
+### What
+
+0.7.3 left "BM25-only / dense-less path" in the gap list. After
+trying to wire it in 0.7.6 we hit a structural blocker:
+
+```bash
+$ curl -X POST $CORAL/v2/tables -d '{
+    "table_name": "...",
+    "columns": [
+        {"name": "embedding", "type": {"name": "DENSE_VECTOR", ...}, "nullable": true},
+        ...
+    ], ...
+}'
+HTTP 400
+error_code 400101
+"Invalid argument: Vector column 'embedding' must not be nullable"
+```
+
+`coral-models/src/api/schema.rs` says the field can carry
+`nullable: true`, but the field's own docstring warns "even if this
+is set to true for Vector type, the server may reject it at
+validation time" — and the live Coral does exactly that on every
+build we've tested. There's no honest way to insert a sparse-only
+row, and therefore no honest way to retrieve one.
+
+Three workarounds were considered and rejected:
+
+1. **Zero-vector for dense=None**. The HNSW index treats every
+   sparse-only row as equidistant from any dense query, so dense
+   recall silently degrades to "random sparse subset" and fusion
+   results become noise. Pretending the row had a vector when it
+   doesn't is dishonest under the AKB sparse_encoder contract.
+2. **`bm25_only` BOOL column + dense-leg filter**. Adds an always-on
+   `WHERE bm25_only = false` to every hybrid_search and a separate
+   sparse-only search path. Big driver change, but the catalog
+   constraint above means we'd still have to write a synthetic
+   embedding value — there's no "skip dense" Coral can express on
+   insert. Same dishonest-on-disk problem as (1), with more
+   moving parts.
+3. **A second sparse-only table alongside the hybrid one**. Doubles
+   the operational surface (two Coral tables, two segment streams,
+   two indexing-state checkpoints) for a feature parity the other
+   drivers expose for free. Not worth it.
+
+### Changes
+
+- `seahorse_db.py` module docstring now states BM25-only is
+  structurally unsupported, with a citation to the catalog 400 and
+  the schema.rs docstring.
+- `upsert_one(dense=None)` and `hybrid_search(query_dense=None)` both
+  raise `VectorStoreUnavailable` with the structural reason and the
+  "use pgvector or qdrant" recommendation in the message. Same
+  behavior as 0.7.3, just clearer about *why* it's permanent.
+- `config.py`'s `vector_store_driver` docstring carries a new
+  paragraph spelling out which drivers tolerate `embed_base_url`
+  being unset/unreachable (pgvector / qdrant) and which don't
+  (both seahorse drivers). Operators picking a driver now have
+  the embed-API-availability dimension in front of them.
+
+### What this means for operators
+
+- If `embed_base_url` is reliable in your environment (OpenRouter,
+  managed embed endpoint, OpenAI), `seahorse-db` is fine — every
+  AKB chunk has a real embedding and the driver behaves like the
+  others.
+- If `embed_base_url` may be empty (self-hosted, no model yet) OR
+  intermittent (degraded endpoint), `seahorse-db` will stall the
+  indexing queue on `dense=None` chunks until the endpoint
+  recovers. Use `pgvector` or `qdrant` if that's the failure mode
+  you need to absorb.
+
+### Not deployed
+
+prod + demo still pgvector. The 4 e2e fails 0.7.3 reported stay open
+— this release closes the BM25-only path as "won't fix in driver";
+the other three (Coral 500 #SeahorseDB/433, Kafka eventual
+consistency budget, retry policy) are still upstream-side.
+
+### Verification
+
+- `bash scripts/check.sh` — green.
+- Coral live-rejection of `nullable: true` on the vector column
+  confirmed by direct curl against `POST /v2/tables`. Documented
+  inline.
+
+---
+
+## 0.7.5 — 2026-06-05  *(patch — `test_seahorse_db_e2e.sh` rewritten with content-type asserts + 0.7.3 wire formats; 13/13 against live Coral)*
+
+### What
+
+The 0.7.1-shipped smoke had been an early-exit skip since 0.7.2's
+retraction (it had reported 6/6 PASS that were all Coral gRPC
+fallbacks). 0.7.4 ships an actual smoke that exercises the wire
+formats `seahorse_db.py` emits.
+
+Every assertion now checks **HTTP status AND
+`content-type: application/json`**. The same-port tonic gRPC
+fallback that fooled 0.7.1 returns `HTTP 200 OK` +
+`content-type: application/grpc` + `grpc-status: 12` on unmatched
+REST paths; the content-type check makes that impossible to confuse
+with a real PASS again.
+
+### Scope
+
+7 stages, 13 assertions, against the 0.7.3 corrected wire formats:
+
+| # | Assertion | Why |
+|---|---|---|
+| 1 | `GET /health` 200 + json | reachability + no gRPC fallback |
+| 2 | `POST /v2/tables` 200 + json | the exact `CreateTableRequest` shape `SeahorseDbStore._build_create_table_payload()` emits (flat `table_name`, SCREAMING_SNAKE column types, `segmentation` hash/single, `indexes` hnsw + inverted with `sparse_model=bm25`) |
+| 3 | `GET /v2/tables/{name}` 200 + json, plus `sparse_model=bm25` and `segmentation`/`primary_key` round-trip in body | mirrors `ensure_collection`'s probe + verifies the create stuck |
+| 3b | `GET /v2/tables/{missing}` 404 + json | negative — 0.7.1's bug was treating 200 + grpc-status as existence |
+| 4 | `POST /v2/tables/{name}/data` with `application/x-ndjson` 200 + json | JSONL is the only accepted content-type |
+| 4b | same `POST` with `application/json` 400 + `Unsupported Content-Type` | if a future Coral starts accepting JSON the driver's pinned content-type silently underspecifies — this assertion catches that |
+| 5 | `POST /data/delete` with `{"delete_condition": "chunk_id = '...'"}` 200 + json, twice | SQL WHERE clause + idempotency |
+| 6 | `POST /data/hybrid-search` with dense+sparse configs + BM25 `parameters`+`metadata` + `fusion` 200 + json; `body.data.data` parses as `list[list[hit]]` | the response envelope shape the driver actually reads |
+| 7 | `DELETE /v2/tables/{name}` 200 + json | cleanup; `trap EXIT` guard against test aborts |
+
+`SEAHORSEDB_CORAL_URL` unset → script exits 0 with a help blurb. CI
+still skips cleanly; developers with a local Coral run it.
+
+### Verified locally against a Coral built from `SDDEV-244/monorepo-coral-sparse`
+
+**13/13 PASS.** Every response checked for `application/json`;
+zero gRPC fallbacks observed.
+
+### Not covered (by design)
+
+- AKB-side end-to-end search relevance — that's `test_hybrid_search_e2e.sh`
+  pointed at a backend running `vector_store_driver: seahorse-db`,
+  which 0.7.3 reports as 21/25 against the same Coral. Driver wire
+  correctness vs retrieval recall are different gates.
+- POST → search visibility lag — Kafka eventual consistency is upstream
+  of this driver; AKB's own e2e budget owns the wait window.
+
+### Files
+
+- `backend/tests/test_seahorse_db_e2e.sh` — rewritten from scratch
+  with two reusable helpers (`coral_call`, `ndjson_post`) that bake
+  the content-type assertion into every call. `trap EXIT cleanup_table`
+  guards against mid-script aborts leaving the smoke's ephemeral
+  table behind.
+
+---
+
+## 0.7.4 — 2026-06-05  *(patch — pgvector driver creates the `vector` extension before registering the asyncpg codec; fixes "unknown type: public.vector" on fresh self-hosted DBs, #117)*
+
+### Semantic search silently returned empty on a fresh self-hosted install
+
+A self-hosted reporter (#117) got zero semantic-search hits on a
+freshly stood-up stack. The backend log showed the embedding endpoint
+answering `200 OK` but every search degrading to empty:
+
+```
+WARNING akb.search: vector hybrid_search failed (unknown type: public.vector); returning empty
+```
+
+**Root cause — codec registered before the extension exists.** The
+`pgvector` driver registers pgvector's asyncpg binary codec
+(`register_vector` → `set_type_codec('vector', schema='public', …)`)
+*before* it runs `CREATE EXTENSION IF NOT EXISTS vector`. asyncpg can't
+build a codec for a type that isn't in the catalog yet, so it raises
+`ValueError: unknown type: public.vector`. That's a `ValueError`, not an
+`asyncpg.PostgresError`, so it slipped past `ensure_collection`'s except
+clause and resurfaced at every `hybrid_search`, where `search_service`
+catches it and returns empty.
+
+The trap is sharpest on the default `pgvector/pgvector` image: the
+extension is *available* but not *created* in a fresh app DB, and the
+one place that would create it (`_do_ensure`) ran *after* the codec
+registration that needed it — a chicken-and-egg that made the first
+`ensure_collection` fail on itself.
+
+Both codec-registration sites are now ordered after extension creation:
+
+- **Own pool** (separate `vector_store_dsn`): a new
+  `_bootstrap_extension()` runs `CREATE EXTENSION IF NOT EXISTS vector`
+  over a one-off connection *before* the pool — whose `init` callback
+  registers the codec — is built.
+- **Shared main pool** (blank DSN): inside `ensure_collection`, the
+  codec is registered *after* `_do_ensure` (whose first statement is
+  the `CREATE EXTENSION`), within the same transaction/connection that
+  already sees its own uncommitted DDL.
+
+Regression test `tests/test_pgvector_ext_bootstrap_e2e.py` exercises the
+real `PgvectorStore` against a throwaway DB with no `vector` extension
+in both pool modes: it failed with the exact `unknown type:
+public.vector` before this change and passes (extension installed +
+dense round-trip + `hybrid_search` returns the chunk) after. Like the
+other DB-backed e2e suites it's excluded from the no-DB CI unit job and
+runs locally / against a deployment.
+
+No schema or data migration. Operators who already worked around this
+by hand (`CREATE EXTENSION vector` + restart) are unaffected; the
+extension creation is idempotent.
+
+## 0.7.3 — 2026-06-05  *(patch — `seahorse-db` BM25 metadata + `sparse_model=bm25` index param; AKB hybrid_search e2e 21/25 against live SeahorseDB)*
+
+### `sparse_model: "bm25"` is required on the INVERTED index
+
+0.7.2 emitted `{"type": "inverted", "column": "sparse"}` with no
+`params` on the sparse index. Coral accepts the table without
+complaint at create time, but `POST /v2/tables/{name}/data/hybrid-search`
+later fails with:
+
+```
+HTTP 503
+error_code 503101
+message: "BM25 sparse scoring requires sparse_model=bm25 index"
+```
+
+0.7.3 pins the param explicitly:
+
+```python
+{
+    "type": "inverted",
+    "column": "sparse",
+    "params": {"sparse_model": "bm25"},
+}
+```
+
+This means **every `seahorse-db` table created by 0.7.0/0.7.1/0.7.2 is
+unusable for hybrid_search** — there is no online migration; the
+table has to be dropped and recreated by the driver on next startup.
+At time of writing, no production or demo cluster runs this driver,
+so the practical blast radius is zero. (If you've been experimenting
+locally: drop the table on Coral and `UPDATE chunks SET
+vector_indexed_at = NULL` to re-emit.)
+
+### BM25 metadata is now sent per query
+
+0.7.2 omitted `parameters` and `metadata` on the sparse leg of
+`hybrid-search`, expecting Coral to fall back to reasonable defaults.
+That worked for the basic-shape e2e but produced empty or
+wrong-doc results on the AKB hybrid-search e2e's English-keyword and
+Korean-keyword scenarios. 0.7.3 ships our corpus stats every query:
+
+- `parameters: {k, b}` — pulled from `bm25_stats` (the values AKB
+  uses for ingest-side encoding, kept consistent with retrieval).
+- `metadata.N` and `metadata.avgdl` — same source.
+- `metadata.df` — per-term document frequencies from `bm25_vocab`,
+  one PG batch fetch per search (~ms even at our scale). Coral
+  takes them as a `Vec<String>` of `"term_id:df term_id:df ..."`,
+  one entry per query vector.
+
+One extra `await sparse_encoder.load_df_for_terms(...)` per search
+call. Cheap; the alternative is shipping the full df table to Coral
+once and hoping it doesn't drift.
+
+### AKB `test_hybrid_search_e2e.sh` against live `seahorse-db`
+
+First real run of AKB's 25-scenario hybrid retrieval e2e with the
+driver pointed at a live Coral (built from SeahorseDB monorepo's
+`SDDEV-244/monorepo-coral-sparse` branch, infra-only scenario kept
+up via `--no-cleanup`). **21/25 PASS** vs **25/25 PASS** for the
+same backend running pgvector against the same chunks.
+
+Failures (all four are recall-side, not driver-side):
+
+- `dense: expected PostgreSQL doc, got: <empty>`
+- `bm25-en: expected GraphQL doc, got: <empty>`
+- `bm25-ko: expected Kubernetes doc, got: hybrid-a-… Guide`
+- `isolation-B: expected vault B doc, got: <empty>`
+
+Two interacting causes:
+
+1. **Coral 500 `error_code 500233` under sustained single-row
+   JSONL load** — ~4–7% of `POST /v2/tables/{name}/data` requests
+   come back 500 with no row-level reason, only `tower_http`
+   "response failed" in Coral's log. Reproduces from AKB's
+   `embed_worker` pacing (~10/sec, serial-per-process); does NOT
+   reproduce from direct curl loops (single, dup PK, 30-concurrent
+   all 100% OK). The chunks that hit retry_count >= 8 stay
+   `vector_indexed_at IS NULL` past the e2e's 180s
+   `wait_for_indexing` budget, so the docs they belong to never
+   become searchable.
+   Filed upstream as [SeahorseDB#433](https://github.com/dn-inc/SeahorseDB/issues/433)
+   with a standalone Python repro.
+
+2. **Kafka eventual consistency** — `POST /data` returns on
+   Kafka-accept, not on segment-visible. Even chunks that DO get
+   through can be invisible to search for ~10-30s. AKB's
+   `embed_worker` marks `vector_indexed_at` at the same point, so a
+   doc you just put may not show up immediately. Same shape any
+   async-indexing driver has, and not strictly a regression — but
+   the 180s e2e budget assumed pgvector's "indexed = visible"
+   semantics.
+
+### Where this leaves the driver
+
+`seahorse-db` driver now passes the bulk of AKB's retrieval workload
+end-to-end, but is **not** at pgvector-parity yet. Honest gaps still
+in:
+
+- The four e2e scenarios above
+- BM25-only / dense-less path raises `VectorStoreUnavailable`
+- Cross-process race-safety on `ensure_collection` ⚠
+- `test_seahorse_db_e2e.sh` is still an early-exit skip (will be
+  rewritten with content-type asserts + 0.7.3 wire formats next)
+- `embed_worker` retry semantics need a Coral 500 backoff /
+  abandon policy distinct from "vector store unavailable"
+
+### Verification
+
+- `bash scripts/check.sh` — green.
+- `vector_store_driver: seahorse-db` startup, `ensure_collection`
+  with new sparse_model:bm25 schema.
+- One doc put → embed_worker → Coral; one search → driver
+  hybrid-search → 2 real hits with BM25 metadata in the payload.
+- `bash backend/tests/test_hybrid_search_e2e.sh` — 21/25 (vs
+  pgvector 25/25).
+
+---
+
 ## 0.7.2 — 2026-06-05  *(patch — `seahorse-db` driver wire format actually verified end-to-end; retracts 0.7.0/0.7.1 false-positive claims)*
 
 ### Retraction of 0.7.0 + 0.7.1 status claims

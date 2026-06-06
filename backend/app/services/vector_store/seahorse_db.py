@@ -45,6 +45,20 @@ some AKB integration tests) need to poll Coral's
 visibility. ``embed_worker`` is fine — it marks `vector_indexed_at`
 on Kafka-accept, and the next search-time gap is the same gap any
 async indexing pipeline has.
+
+**BM25-only fallback is NOT supported by this driver.** pgvector
+ships ``dense IS NULL`` rows + a partial HNSW index when the
+embedding API is unavailable, so AKB's ``embed_base_url`` can be left
+unset and the BM25 leg still serves results. Coral rejects that path
+at the catalog level: ``POST /v2/tables`` with ``embedding`` column
+``nullable: true`` returns ``HTTP 400 error_code 400101 "Vector
+column 'embedding' must not be nullable"`` (see
+``coral-models/src/api/schema.rs`` — the field's own docstring warns
+"server may reject it at validation time even if nullable=true").
+Both ``upsert_one(dense=None)`` and ``hybrid_search(query_dense=None)``
+therefore raise ``VectorStoreUnavailable`` immediately. Operators
+who need BM25-only resilience should run pgvector or qdrant; an
+``embed_base_url`` outage will fail the upsert path here.
 """
 
 from __future__ import annotations
@@ -63,36 +77,11 @@ from .base import VectorHit, VectorStoreUnavailable, has_dense
 logger = logging.getLogger("akb.vector_store.seahorse_db")
 
 
-def _validate_uuid_for_sql(s: str) -> str:
-    """Reject anything that isn't a UUID before interpolating into a
-    SQL WHERE clause. AKB source_ids are always UUIDs; this is purely
-    defense in depth against any caller mistake."""
-    uuid.UUID(s)
-    return s
-
-
-def _encode_sparse_string(
-    indices: list[int], values: list[float],
-) -> str:
-    """Encode AKB's parallel sparse arrays into Coral's
-    ``"term_id:weight term_id:weight"`` string format (space-separated,
-    one pair per token). Verified against the live Coral hybrid
-    search request handler — sparse vectors arrive as a single string
-    on this column, not as a list of pairs or as a JSON sub-object."""
-    if not indices:
-        return ""
-    return " ".join(f"{int(t)}:{float(w):.6g}" for t, w in zip(indices, values))
-
-
-def _chunk_id_to_label(chunk_id: str) -> int:
-    """UUID -> SeahorseDB u64 label.
-
-    First 8 bytes of the UUID's binary form, interpreted big-endian.
-    Stable, dependency-free, no DB round-trip. Collisions are
-    birthday-paradox bounded — ~2^32 chunks per table before a 50%
-    chance of any pair colliding, far beyond any realistic vault."""
-    raw = uuid.UUID(chunk_id).bytes
-    return int.from_bytes(raw[:8], "big", signed=False)
+from ._seahorse_common import (
+    chunk_id_to_label as _chunk_id_to_label,
+    encode_sparse_string as _encode_sparse_string,
+    validate_uuid_for_sql as _validate_uuid_for_sql,
+)
 
 
 class SeahorseDbStore:
@@ -257,13 +246,21 @@ class SeahorseDbStore:
         if has_dense(dense):
             record["embedding"] = dense
         else:
-            # Schema requires embedding NOT NULL; we don't yet have a
-            # BM25-only path for seahorse-db. Surface explicitly so the
-            # worker's per-row failure path catches it instead of Coral
-            # rejecting the whole row with a less specific error.
+            # Coral's CreateTableRequest rejects ``nullable: true`` on
+            # vector columns at validation time (HTTP 400 error_code
+            # 400101 "Vector column 'embedding' must not be nullable",
+            # see module docstring). There's no honest way to upsert
+            # a sparse-only row into this schema, so we fail loud and
+            # let the worker's per-row failure path catch it instead
+            # of Coral's whole-batch rejection with a less specific
+            # error. Operators who need BM25-only resilience under an
+            # embed-API outage should run pgvector or qdrant.
             raise VectorStoreUnavailable(
-                "seahorse-db driver requires a dense embedding per row; "
-                "BM25-only fallback (dense=None) is not yet supported."
+                "seahorse-db requires a dense embedding per row "
+                "(Coral schema forbids NULL on vector columns). "
+                "BM25-only fallback is structurally unsupported by "
+                "this driver — use pgvector / qdrant if "
+                "embed_base_url may be unset or unreachable."
             )
 
         body = json.dumps(record, separators=(",", ":"))
@@ -362,18 +359,56 @@ class SeahorseDbStore:
         """
         # Dense-only and sparse-only modes both need a non-empty
         # ``vectors`` payload on the empty-side config or Coral
-        # returns 400. We could fall back to the single-leg vector
-        # search endpoints when one side is missing, but that's a
-        # bigger driver change — for now both legs must be present.
+        # returns 400. The single-leg vector-search endpoints
+        # (``/v2/tables/{name}/data/indexes/{index}/vector-search``)
+        # exist, but the corresponding upsert path is structurally
+        # blocked by Coral's NOT NULL on the embedding column (see
+        # module docstring), so we can't reach a state where this
+        # branch would be useful for AKB — the table can never
+        # contain a sparse-only row to retrieve. Failing loud here
+        # is consistent with `upsert_one`'s dense=None refusal.
         if not has_dense(query_dense):
             raise VectorStoreUnavailable(
-                "seahorse-db hybrid_search requires query_dense; "
-                "dense-less query path is not yet implemented."
+                "seahorse-db hybrid_search requires query_dense "
+                "(Coral schema forbids NULL on the embedding column, "
+                "so a sparse-only row can never exist to retrieve). "
+                "Use pgvector / qdrant for BM25-only search."
             )
 
         sparse_string = _encode_sparse_string(
             query_sparse_indices, query_sparse_values,
         )
+
+        # BM25 metadata + parameters: Coral defaults gave noticeably
+        # worse recall on the 25-scenario hybrid e2e (BM25-en /
+        # BM25-ko / cross-vault-B all missed). Ship our corpus stats
+        # (`N`, `avgdl`) + the per-term df for the query's vocabulary.
+        # Cheap when the vocab is small (typical Kiwi-tokenised
+        # Korean queries are 3-8 tokens), one extra PG fetch per
+        # search. AKB's stats are already cached in sparse_encoder
+        # with a TTL.
+        from app.services import sparse_encoder
+        bm25_stats = await sparse_encoder.load_stats()
+        n_docs = int(bm25_stats.get("total_docs") or 0)
+        avgdl = float(bm25_stats.get("avgdl") or 0.0)
+        sparse_params: dict[str, Any] = {
+            "k": float(bm25_stats.get("k1") or 1.5),
+            "b": float(bm25_stats.get("b") or 0.75),
+        }
+        sparse_metadata: dict[str, Any] | None = None
+        if n_docs > 0 and avgdl > 0 and query_sparse_indices:
+            df_map = await sparse_encoder.load_df_for_terms(query_sparse_indices)
+            # Coral's SparseMetadata.df is `Vec<String>` — one entry per
+            # query vector, each string is "term_id:df term_id:df ...".
+            df_str = " ".join(
+                f"{int(t)}:{int(df_map.get(int(t), 0))}"
+                for t in query_sparse_indices
+            )
+            sparse_metadata = {
+                "N": n_docs,
+                "avgdl": avgdl,
+                "df": [df_str],
+            }
 
         payload: dict[str, Any] = {
             "top_k": limit,
@@ -387,14 +422,15 @@ class SeahorseDbStore:
             "sparse": {
                 "column": "sparse",
                 "vectors": [sparse_string or " "],
-                # BM25 parameters/metadata omitted on purpose — see
-                # the docstring; Coral picks defaults.
+                "parameters": sparse_params,
             },
             "fusion": {"type": "rrf", "parameters": {"k": 60}},
             "projection": (
                 "chunk_id, source_type, source_id, section_path, content"
             ),
         }
+        if sparse_metadata is not None:
+            payload["sparse"]["metadata"] = sparse_metadata
         if source_ids:
             # SQL WHERE clause — Coral parses this directly. Each
             # `source_id` is a UUID, so the IN list is safe to
@@ -522,6 +558,13 @@ class SeahorseDbStore:
                 {
                     "type": "inverted",
                     "column": "sparse",
+                    # Coral rejects hybrid-search with
+                    # `BM25 sparse scoring requires sparse_model=bm25 index`
+                    # when this is omitted, even though the index is
+                    # created either way. Pin to bm25 explicitly so the
+                    # search-time path can apply our (k, b, N, avgdl, df)
+                    # metadata.
+                    "params": {"sparse_model": "bm25"},
                 },
             ],
         }
